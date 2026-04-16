@@ -197,6 +197,288 @@ fn is_safe_img_src(url: &str) -> bool {
     !lower.split('/').next().unwrap_or("").contains(':')
 }
 
+// ── SVG / PNG export ────────────────────────────────────────────────────────
+
+/// Character cell metrics used when building the SVG viewport.
+const CHAR_WIDTH: f64 = 9.6;
+const LINE_HEIGHT: f64 = 20.0;
+const FONT_SIZE: f64 = 16.0;
+const PAD: f64 = 20.0;
+
+/// Render a slice of `Line`s to a self-contained SVG string.
+/// Each `StyledSpan` becomes a `<tspan>` with the correct colours and
+/// font attributes; background colours get a `<rect>` drawn behind the text.
+pub fn to_svg_string(lines: &[crate::style::Line], width: usize, theme: &Theme) -> String {
+    use std::fmt::Write as FmtWrite;
+
+    let svg_w = width as f64 * CHAR_WIDTH + PAD * 2.0;
+    let svg_h = lines.len() as f64 * LINE_HEIGHT + PAD * 2.0;
+
+    let mut svg = String::new();
+    let _ = write!(
+        svg,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">"#,
+        w = svg_w as u32,
+        h = svg_h as u32,
+    );
+
+    // Background
+    let _ = write!(
+        svg,
+        r#"<rect width="{w}" height="{h}" fill="{bg}"/>"#,
+        w = svg_w as u32,
+        h = svg_h as u32,
+        bg = color_css(theme.bg),
+    );
+
+    // Font definition embedded once
+    let _ = write!(
+        svg,
+        r#"<style>text{{font-family:'Courier New',Courier,monospace;font-size:{fs}px;dominant-baseline:auto;}}</style>"#,
+        fs = FONT_SIZE as u32,
+    );
+
+    for (row, line) in lines.iter().enumerate() {
+        let y_top = PAD + row as f64 * LINE_HEIGHT;
+        let y_baseline = y_top + LINE_HEIGHT * 0.78; // ~78% from top = cap-height baseline
+
+        // Background rects for spans that have a bg colour
+        let mut col: f64 = 0.0;
+        for span in &line.spans {
+            let span_w = span.text.chars().count() as f64 * CHAR_WIDTH;
+            if let Some(bg) = span.style.bg {
+                let _ = write!(
+                    svg,
+                    r#"<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{fill}"/>"#,
+                    x = (PAD + col) as u32,
+                    y = y_top as u32,
+                    w = span_w as u32,
+                    h = LINE_HEIGHT as u32,
+                    fill = color_css(bg),
+                );
+            }
+            col += span_w;
+        }
+
+        if line.spans.is_empty() {
+            continue;
+        }
+
+        // Text + tspans
+        let _ = write!(
+            svg,
+            r#"<text x="{x}" y="{y}" xml:space="preserve">"#,
+            x = PAD as u32,
+            y = y_baseline as u32,
+        );
+
+        for span in &line.spans {
+            let mut attrs = String::new();
+            let fg = span.style.fg.unwrap_or(theme.fg);
+            let _ = write!(attrs, r#" fill="{}""#, color_css(fg));
+            if span.style.bold {
+                let _ = write!(attrs, r#" font-weight="bold""#);
+            }
+            if span.style.italic {
+                let _ = write!(attrs, r#" font-style="italic""#);
+            }
+            let mut decorations: Vec<&str> = Vec::new();
+            if span.style.underline {
+                decorations.push("underline");
+            }
+            if span.style.strikethrough {
+                decorations.push("line-through");
+            }
+            if !decorations.is_empty() {
+                let _ = write!(attrs, r#" text-decoration="{}""#, decorations.join(" "));
+            }
+            if span.style.dim {
+                let _ = write!(attrs, r#" opacity="0.5""#);
+            }
+            let _ = write!(svg, "<tspan{}>", attrs);
+            svg_escape_into(&mut svg, &span.text);
+            let _ = write!(svg, "</tspan>");
+        }
+
+        let _ = write!(svg, "</text>");
+    }
+
+    let _ = write!(svg, "</svg>");
+    svg
+}
+
+/// Escape text content for safe embedding inside SVG.
+fn svg_escape_into(out: &mut String, s: &str) {
+    use std::fmt::Write as FmtWrite;
+    for c in s.chars() {
+        match c {
+            '&' => {
+                let _ = out.write_str("&amp;");
+            }
+            '<' => {
+                let _ = out.write_str("&lt;");
+            }
+            '>' => {
+                let _ = out.write_str("&gt;");
+            }
+            '"' => {
+                let _ = out.write_str("&quot;");
+            }
+            '\'' => {
+                let _ = out.write_str("&#39;");
+            }
+            c => {
+                let _ = out.write_char(c);
+            }
+        }
+    }
+}
+
+/// Returns `(slide_start, slide_end)` index pairs into `wrapped` for each
+/// slide. If there are no `SlideBreak` lines the whole document is one slide.
+fn slide_ranges(wrapped: &[crate::style::Line]) -> Vec<(usize, usize)> {
+    let mut starts: Vec<usize> = vec![0];
+    for (i, line) in wrapped.iter().enumerate() {
+        if matches!(line.meta, LineMeta::SlideBreak) {
+            starts.push(i + 1);
+        }
+    }
+    let total = wrapped.len();
+    starts
+        .iter()
+        .enumerate()
+        .map(|(idx, &start)| {
+            let end = starts.get(idx + 1).copied().unwrap_or(total);
+            (start, end)
+        })
+        .collect()
+}
+
+/// Export the document (or its slides) as a series of SVG files.
+/// With `slide_mode = true`, one file per slide; otherwise a single file.
+/// Files are written as `{prefix}0001.svg`, `{prefix}0002.svg`, …
+pub fn export_slides_svg(
+    content: &str,
+    width: usize,
+    theme: &Theme,
+    prefix: &str,
+    slide_mode: bool,
+) {
+    use std::fs;
+    use std::path::Path;
+
+    let (lines, _) = markdown::render(content, width, theme, false);
+    let wrapped = crate::style::wrap_lines(&lines, width);
+
+    let ranges = if slide_mode {
+        slide_ranges(&wrapped)
+    } else {
+        vec![(0, wrapped.len())]
+    };
+
+    // Ensure output directory exists
+    if let Some(parent) = Path::new(prefix).parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                eprintln!("Error creating output directory: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    for (idx, (start, end)) in ranges.iter().enumerate() {
+        let slide_lines = &wrapped[*start..*end];
+        let svg = to_svg_string(slide_lines, width, theme);
+        let path = format!("{}{:04}.svg", prefix, idx + 1);
+        if let Err(e) = fs::write(&path, &svg) {
+            eprintln!("Error writing '{}': {}", path, e);
+            std::process::exit(1);
+        }
+        eprintln!("Wrote {}", path);
+    }
+}
+
+/// Rasterize an SVG string to a PNG byte vector using `resvg`.
+fn svg_to_png(svg_str: &str) -> Vec<u8> {
+    use resvg::usvg;
+
+    let opt = usvg::Options::default();
+    let tree = match usvg::Tree::from_str(svg_str, &opt) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("SVG parse error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let size = tree.size();
+    let w = size.width().ceil() as u32;
+    let h = size.height().ceil() as u32;
+
+    let mut pixmap = match resvg::tiny_skia::Pixmap::new(w, h) {
+        Some(p) => p,
+        None => {
+            eprintln!("Error: could not allocate {}×{} pixmap", w, h);
+            std::process::exit(1);
+        }
+    };
+
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::identity(),
+        &mut pixmap.as_mut(),
+    );
+
+    pixmap.encode_png().unwrap_or_else(|e| {
+        eprintln!("PNG encoding error: {}", e);
+        std::process::exit(1);
+    })
+}
+
+/// Export the document (or its slides) as a series of PNG files.
+/// Files are written as `{prefix}0001.png`, `{prefix}0002.png`, …
+pub fn export_slides_png(
+    content: &str,
+    width: usize,
+    theme: &Theme,
+    prefix: &str,
+    slide_mode: bool,
+) {
+    use std::fs;
+    use std::path::Path;
+
+    let (lines, _) = markdown::render(content, width, theme, false);
+    let wrapped = crate::style::wrap_lines(&lines, width);
+
+    let ranges = if slide_mode {
+        slide_ranges(&wrapped)
+    } else {
+        vec![(0, wrapped.len())]
+    };
+
+    // Ensure output directory exists
+    if let Some(parent) = Path::new(prefix).parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                eprintln!("Error creating output directory: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    for (idx, (start, end)) in ranges.iter().enumerate() {
+        let slide_lines = &wrapped[*start..*end];
+        let svg = to_svg_string(slide_lines, width, theme);
+        let png = svg_to_png(&svg);
+        let path = format!("{}{:04}.png", prefix, idx + 1);
+        if let Err(e) = fs::write(&path, &png) {
+            eprintln!("Error writing '{}': {}", path, e);
+            std::process::exit(1);
+        }
+        eprintln!("Wrote {}", path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

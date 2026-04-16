@@ -43,9 +43,15 @@ struct Cli {
     #[arg(long, short = 'l')]
     line_numbers: bool,
 
-    /// Export format instead of interactive view (html)
+    /// Export format instead of interactive view (html, svg, png)
     #[arg(long)]
     export: Option<String>,
+
+    /// Output path prefix for image exports (e.g. ./out/slide_)
+    /// Required with --export svg or --export png.
+    /// Files are written as <prefix>0001.svg / <prefix>0001.png etc.
+    #[arg(long)]
+    export_prefix: Option<String>,
 
     /// Disable colors
     #[arg(long)]
@@ -113,12 +119,30 @@ fn main() {
                 let w = if width > 0 { width } else { 80 };
                 export::to_html(&content, w, &initial_theme, &filename);
             }
+            "svg" | "png" => {
+                let prefix = cli.export_prefix.as_deref().unwrap_or_else(|| {
+                    eprintln!("Error: --export-prefix is required with --export {}", fmt);
+                    process::exit(1);
+                });
+                let w = if width > 0 { width } else { 80 };
+                if fmt == "svg" {
+                    export::export_slides_svg(&content, w, &initial_theme, prefix, cli.slides);
+                } else {
+                    export::export_slides_png(&content, w, &initial_theme, prefix, cli.slides);
+                }
+            }
             _ => {
-                eprintln!("Unknown export format '{}'. Supported: html", fmt);
+                eprintln!("Unknown export format '{}'. Supported: html, svg, png", fmt);
                 process::exit(1);
             }
         }
         return;
+    }
+
+    // --export-prefix without --export is an error
+    if cli.export_prefix.is_some() {
+        eprintln!("Error: --export-prefix requires --export svg or --export png");
+        process::exit(1);
     }
 
     // Interactive or piped
