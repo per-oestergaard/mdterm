@@ -1,6 +1,7 @@
 use std::io::{self, Write};
 
 use crossterm::style::Color;
+use unicode_width::UnicodeWidthStr;
 
 use crate::markdown;
 use crate::style::{LineMeta, wrap_lines};
@@ -199,11 +200,11 @@ fn is_safe_img_src(url: &str) -> bool {
 
 // ── SVG / PNG export ────────────────────────────────────────────────────────
 
-/// Character cell metrics used when building the SVG viewport.
-const CHAR_WIDTH: f64 = 9.6;
-const LINE_HEIGHT: f64 = 20.0;
-const FONT_SIZE: f64 = 16.0;
-const PAD: f64 = 20.0;
+/// Character cell metrics used when building the SVG viewport (3× scale).
+const CHAR_WIDTH: f64 = 28.8;
+const LINE_HEIGHT: f64 = 60.0;
+const FONT_SIZE: f64 = 48.0;
+const PAD: f64 = 60.0;
 
 /// Render a slice of `Line`s to a self-contained SVG string.
 /// Each `StyledSpan` becomes a `<tspan>` with the correct colours and
@@ -222,7 +223,8 @@ pub fn to_svg_string(lines: &[crate::style::Line], width: usize, theme: &Theme) 
         h = svg_h as u32,
     );
 
-    // Background
+    // Background — use the theme's background colour so dark/light themes
+    // both render correctly.
     let _ = write!(
         svg,
         r#"<rect width="{w}" height="{h}" fill="{bg}"/>"#,
@@ -231,10 +233,11 @@ pub fn to_svg_string(lines: &[crate::style::Line], width: usize, theme: &Theme) 
         bg = color_css(theme.bg),
     );
 
-    // Font definition embedded once
+    // Font definition embedded once; DejaVu Sans Mono is the primary fallback
+    // for environments where Courier New is not installed.
     let _ = write!(
         svg,
-        r#"<style>text{{font-family:'Courier New',Courier,monospace;font-size:{fs}px;dominant-baseline:auto;}}</style>"#,
+        r#"<style>text{{font-family:'Courier New','DejaVu Sans Mono',Courier,monospace;font-size:{fs}px;dominant-baseline:auto;}}</style>"#,
         fs = FONT_SIZE as u32,
     );
 
@@ -245,7 +248,7 @@ pub fn to_svg_string(lines: &[crate::style::Line], width: usize, theme: &Theme) 
         // Background rects for spans that have a bg colour
         let mut col: f64 = 0.0;
         for span in &line.spans {
-            let span_w = span.text.chars().count() as f64 * CHAR_WIDTH;
+            let span_w = UnicodeWidthStr::width(span.text.as_str()) as f64 * CHAR_WIDTH;
             if let Some(bg) = span.style.bg {
                 let _ = write!(
                     svg,
@@ -264,16 +267,19 @@ pub fn to_svg_string(lines: &[crate::style::Line], width: usize, theme: &Theme) 
             continue;
         }
 
-        // Text + tspans
+        // Text + tspans — each tspan gets an explicit x so wide/emoji chars
+        // (which fall back to a non-monospace font) cannot shift subsequent spans.
         let _ = write!(
             svg,
-            r#"<text x="{x}" y="{y}" xml:space="preserve">"#,
-            x = PAD as u32,
+            r#"<text y="{y}" xml:space="preserve">"#,
             y = y_baseline as u32,
         );
 
+        let mut x_pos = PAD;
         for span in &line.spans {
+            let span_w = UnicodeWidthStr::width(span.text.as_str()) as f64 * CHAR_WIDTH;
             let mut attrs = String::new();
+            let _ = write!(attrs, r#" x="{}""#, x_pos as u32);
             let fg = span.style.fg.unwrap_or(theme.fg);
             let _ = write!(attrs, r#" fill="{}""#, color_css(fg));
             if span.style.bold {
@@ -298,6 +304,7 @@ pub fn to_svg_string(lines: &[crate::style::Line], width: usize, theme: &Theme) 
             let _ = write!(svg, "<tspan{}>", attrs);
             svg_escape_into(&mut svg, &span.text);
             let _ = write!(svg, "</tspan>");
+            x_pos += span_w;
         }
 
         let _ = write!(svg, "</text>");
@@ -399,10 +406,15 @@ pub fn export_slides_svg(
 }
 
 /// Rasterize an SVG string to a PNG byte vector using `resvg`.
-fn svg_to_png(svg_str: &str) -> Vec<u8> {
+/// `bg` is the theme background colour used to pre-fill the pixmap so that
+/// image viewers that don't handle alpha see the correct opaque background.
+fn svg_to_png(svg_str: &str, bg: Color) -> Vec<u8> {
     use resvg::usvg;
+    use resvg::tiny_skia;
 
-    let opt = usvg::Options::default();
+    let mut opt = usvg::Options::default();
+    // Load system fonts so that text elements are rendered correctly.
+    opt.fontdb_mut().load_system_fonts();
     let tree = match usvg::Tree::from_str(svg_str, &opt) {
         Ok(t) => t,
         Err(e) => {
@@ -415,7 +427,7 @@ fn svg_to_png(svg_str: &str) -> Vec<u8> {
     let w = size.width().ceil() as u32;
     let h = size.height().ceil() as u32;
 
-    let mut pixmap = match resvg::tiny_skia::Pixmap::new(w, h) {
+    let mut pixmap = match tiny_skia::Pixmap::new(w, h) {
         Some(p) => p,
         None => {
             eprintln!("Error: could not allocate {}×{} pixmap", w, h);
@@ -423,9 +435,17 @@ fn svg_to_png(svg_str: &str) -> Vec<u8> {
         }
     };
 
+    // Pre-fill with the theme background so the PNG is fully opaque even if
+    // the SVG rect blending leaves residual transparency in the alpha channel.
+    let (r, g, b) = match bg {
+        Color::Rgb { r, g, b } => (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0),
+        _ => (0.0, 0.0, 0.0),
+    };
+    pixmap.fill(tiny_skia::Color::from_rgba(r, g, b, 1.0).unwrap_or(tiny_skia::Color::BLACK));
+
     resvg::render(
         &tree,
-        resvg::tiny_skia::Transform::identity(),
+        tiny_skia::Transform::identity(),
         &mut pixmap.as_mut(),
     );
 
@@ -469,7 +489,7 @@ pub fn export_slides_png(
     for (idx, (start, end)) in ranges.iter().enumerate() {
         let slide_lines = &wrapped[*start..*end];
         let svg = to_svg_string(slide_lines, width, theme);
-        let png = svg_to_png(&svg);
+        let png = svg_to_png(&svg, theme.bg);
         let path = format!("{}{:04}.png", prefix, idx + 1);
         if let Err(e) = fs::write(&path, &png) {
             eprintln!("Error writing '{}': {}", path, e);

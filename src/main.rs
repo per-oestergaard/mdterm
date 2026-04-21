@@ -124,7 +124,7 @@ fn main() {
                     eprintln!("Error: --export-prefix is required with --export {}", fmt);
                     process::exit(1);
                 });
-                let w = if width > 0 { width } else { 80 };
+                let w = if width > 0 { width } else { 120 };
                 if fmt == "svg" {
                     export::export_slides_svg(&content, w, &initial_theme, prefix, cli.slides);
                 } else {
