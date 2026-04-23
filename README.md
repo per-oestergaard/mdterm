@@ -111,12 +111,20 @@ mdterm README.md | less -R
 
 ### Slide Mode (`--slides`)
 
+Slides show only the current slide content (no adjacent slides visible). Tall slides can be scrolled.
+
 | Key | Action |
 |-----|--------|
-| `Right` / `Space` / `l` / `j` / `Down` / `Page Down` | Next slide |
-| `Left` / `b` / `h` / `k` / `Up` / `Page Up` | Previous slide |
+| `j` / `Down` | Scroll down one line within slide |
+| `k` / `Up` | Scroll up one line within slide |
+| `Space` / `Page Down` | Scroll down one page (or next slide if at bottom) |
+| `b` / `Page Up` | Scroll up one page (or previous slide if at top) |
+| `Right` / `l` | Next slide (jump, reset to top) |
+| `Left` / `h` | Previous slide (jump, reset to top) |
 | `g` / `Home` | First slide |
 | `G` / `End` | Last slide |
+| `t` | Toggle theme |
+| Mouse scroll | Scroll within slide |
 
 ## Configuration
 

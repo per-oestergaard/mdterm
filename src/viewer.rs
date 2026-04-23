@@ -287,6 +287,7 @@ struct ViewerState {
 
     // Slide mode
     current_slide: usize,
+    slide_offset: usize,          // scroll position within current slide
     slide_boundaries: Vec<usize>, // wrapped line indices
 
     // File change notifications (inotify/FSEvents/kqueue)
@@ -391,6 +392,7 @@ impl ViewerState {
             fuzzy_selected: 0,
             fuzzy_scroll: 0,
             current_slide: 0,
+            slide_offset: 0,
             slide_boundaries: Vec::new(),
             file_watcher,
             file_change_rx,
@@ -438,6 +440,26 @@ impl ViewerState {
             return 0; // slides handle their own offset
         }
         self.wrapped.len().saturating_sub(self.viewport())
+    }
+
+    fn current_slide_height(&self) -> usize {
+        let start = self
+            .slide_boundaries
+            .get(self.current_slide)
+            .copied()
+            .unwrap_or(0);
+        let end = self
+            .slide_boundaries
+            .get(self.current_slide + 1)
+            .copied()
+            .unwrap_or(self.wrapped.len());
+        end - start
+    }
+
+    fn max_slide_offset(&self) -> usize {
+        let slide_height = self.current_slide_height();
+        let viewport = self.viewport();
+        slide_height.saturating_sub(viewport)
     }
 
     fn rebuild(&mut self) {
@@ -498,6 +520,7 @@ impl ViewerState {
                     cw,
                     &self.theme,
                     self.line_numbers,
+                    self.slide_mode,
                     &self.syntect_res,
                 )
             }
@@ -508,6 +531,7 @@ impl ViewerState {
                 cw,
                 &self.theme,
                 self.line_numbers,
+                self.slide_mode,
                 &self.syntect_res,
             )
         };
@@ -529,7 +553,6 @@ impl ViewerState {
                 entry.push_str(&text);
             }
         }
-
         self.wrapped = wrap_lines(&lines, cw);
         self.doc_info = doc_info;
 
@@ -689,6 +712,9 @@ impl ViewerState {
             self.slide_boundaries.push(0);
             for (i, line) in self.wrapped.iter().enumerate() {
                 if matches!(line.meta, LineMeta::SlideBreak) {
+                    // Slide ends before break (at i), next slide starts after break (at i+1)
+                    // But we only store the starts, so push i+1
+                    // The break at index i will be skipped during rendering
                     self.slide_boundaries.push(i + 1);
                 }
             }
@@ -774,6 +800,7 @@ impl ViewerState {
             self.json_view = None;
             self.cached_json = None;
             self.current_slide = 0;
+            self.slide_offset = 0;
             self.rebuild();
             self.watch_current_file();
             true
@@ -1060,6 +1087,7 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
             MouseEventKind::ScrollDown => {
                 let prev_offset = state.offset;
                 let prev_slide = state.current_slide;
+                let prev_slide_offset = state.slide_offset;
                 let prev_help = state.help_scroll;
                 let prev_toc = (state.toc_selected, state.toc_scroll);
                 let prev_fuzzy = (state.fuzzy_selected, state.fuzzy_scroll);
@@ -1080,9 +1108,7 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                         handle_fuzzy(state, KeyCode::Down, KeyModifiers::empty());
                     }
                     _ if state.slide_mode => {
-                        if state.current_slide + 1 < state.slide_boundaries.len() {
-                            state.current_slide += 1;
-                        }
+                        handle_slide_keys(state, KeyCode::Down);
                     }
                     _ => {
                         let max = state.max_offset();
@@ -1091,6 +1117,7 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                 }
                 if state.offset != prev_offset
                     || state.current_slide != prev_slide
+                    || state.slide_offset != prev_slide_offset
                     || state.help_scroll != prev_help
                     || (state.toc_selected, state.toc_scroll) != prev_toc
                     || (state.fuzzy_selected, state.fuzzy_scroll) != prev_fuzzy
@@ -1101,6 +1128,7 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
             MouseEventKind::ScrollUp => {
                 let prev_offset = state.offset;
                 let prev_slide = state.current_slide;
+                let prev_slide_offset = state.slide_offset;
                 let prev_help = state.help_scroll;
                 let prev_toc = (state.toc_selected, state.toc_scroll);
                 let prev_fuzzy = (state.fuzzy_selected, state.fuzzy_scroll);
@@ -1115,7 +1143,7 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                         handle_fuzzy(state, KeyCode::Up, KeyModifiers::empty());
                     }
                     _ if state.slide_mode => {
-                        state.current_slide = state.current_slide.saturating_sub(1);
+                        handle_slide_keys(state, KeyCode::Up);
                     }
                     _ => {
                         state.offset = state.offset.saturating_sub(3);
@@ -1123,6 +1151,7 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                 }
                 if state.offset != prev_offset
                     || state.current_slide != prev_slide
+                    || state.slide_offset != prev_slide_offset
                     || state.help_scroll != prev_help
                     || (state.toc_selected, state.toc_scroll) != prev_toc
                     || (state.fuzzy_selected, state.fuzzy_scroll) != prev_fuzzy
@@ -1765,32 +1794,65 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
 
 fn handle_slide_keys(state: &mut ViewerState, code: KeyCode) -> bool {
     let num_slides = state.slide_boundaries.len().max(1);
+    let viewport = state.viewport();
+    let max_slide_offset = state.max_slide_offset();
+
     match code {
         KeyCode::Char('q') | KeyCode::Esc => return true,
-        KeyCode::Right
-        | KeyCode::Char(' ')
-        | KeyCode::Char('l')
-        | KeyCode::Char('j')
-        | KeyCode::Down
-        | KeyCode::PageDown => {
-            if state.current_slide + 1 < num_slides {
-                state.current_slide += 1;
+
+        // Scroll within slide only (no auto-advance)
+        KeyCode::Down | KeyCode::Char('j') => {
+            if state.slide_offset < max_slide_offset {
+                state.slide_offset += 1;
             }
         }
-        KeyCode::Left
-        | KeyCode::Char('h')
-        | KeyCode::Char('k')
-        | KeyCode::Up
-        | KeyCode::PageUp
-        | KeyCode::Char('b') => {
-            state.current_slide = state.current_slide.saturating_sub(1);
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.slide_offset = state.slide_offset.saturating_sub(1);
         }
+
+        // Page scroll: scroll within slide, then advance/retreat
+        KeyCode::PageDown | KeyCode::Char(' ') => {
+            if state.slide_offset < max_slide_offset {
+                state.slide_offset = (state.slide_offset + viewport).min(max_slide_offset);
+            } else if state.current_slide + 1 < num_slides {
+                state.current_slide += 1;
+                state.slide_offset = 0;
+            }
+        }
+        KeyCode::PageUp | KeyCode::Char('b') => {
+            if state.slide_offset > 0 {
+                state.slide_offset = state.slide_offset.saturating_sub(viewport);
+            } else if state.current_slide > 0 {
+                state.current_slide -= 1;
+                state.slide_offset = state.max_slide_offset();
+            }
+        }
+
+        // Explicit slide navigation
+        KeyCode::Right | KeyCode::Char('l') => {
+            if state.current_slide + 1 < num_slides {
+                state.current_slide += 1;
+                state.slide_offset = 0;
+            }
+        }
+        KeyCode::Left | KeyCode::Char('h') => {
+            if state.current_slide > 0 {
+                state.current_slide -= 1;
+                state.slide_offset = 0;
+            }
+        }
+
+        // Jump to first/last slide
         KeyCode::Char('g') | KeyCode::Home => {
             state.current_slide = 0;
+            state.slide_offset = 0;
         }
         KeyCode::Char('G') | KeyCode::End => {
             state.current_slide = num_slides.saturating_sub(1);
+            state.slide_offset = 0;
         }
+
+        // Theme toggle
         KeyCode::Char('t') => {
             state.theme = state.theme.toggle();
             state.rebuild();
@@ -2428,12 +2490,12 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
             .get(state.current_slide)
             .copied()
             .unwrap_or(0);
-        let end = state
+        let slide_end = state
             .slide_boundaries
             .get(state.current_slide + 1)
             .copied()
             .unwrap_or(state.wrapped.len());
-        (start, end)
+        (start + state.slide_offset, slide_end)
     } else {
         (state.offset, usize::MAX)
     };
@@ -2500,134 +2562,139 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
         let mut drew_inline_image = false;
         // Clamp to current slide: lines past slide_end render as blank.
         if let Some(line) = state.wrapped.get(line_idx).filter(|_| line_idx < slide_end) {
-            // Render image pixels inline (Kitty / iTerm2).
-            // Suppressed when an overlay is active to prevent images bleeding through.
-            if !suppress_images
-                && let LineMeta::Image {
-                    ref url,
-                    row: image_row,
-                    ..
-                } = line.meta
-                && state.image_cache.is_ready_to_render(url)
-            {
-                drew_inline_image = state.image_cache.render_image_row(
-                    stdout,
-                    url,
-                    image_row,
-                    content_width,
-                    theme.bg,
-                )?;
-            }
-
-            // Render placeholder for images not yet ready (loading or pre-rendering)
-            if !drew_inline_image
-                && let LineMeta::Image {
-                    ref url,
-                    ref alt,
-                    row: image_row,
-                    ..
-                } = line.meta
-                && !state.image_cache.is_ready_to_render(url)
-            {
-                if image_row == 0 {
-                    let label_text = if alt.is_empty() {
-                        url.as_str()
-                    } else {
-                        alt.as_str()
-                    };
-                    let prefix = "[ Loading: ";
-                    let suffix = " ]";
-                    let max_inner = content_width.saturating_sub(prefix.len() + suffix.len());
-                    let truncated: String = label_text.chars().take(max_inner).collect();
-                    let label = format!("{prefix}{truncated}{suffix}");
-                    let label_len = label.chars().count();
-                    let pad = content_width.saturating_sub(label_len) / 2;
-                    queue!(
+            // Skip slide break dividers in slide mode
+            if state.slide_mode && matches!(line.meta, LineMeta::SlideBreak) {
+                queue!(stdout, Print(" ".repeat(content_width)))?;
+            } else {
+                // Render image pixels inline (Kitty / iTerm2).
+                // Suppressed when an overlay is active to prevent images bleeding through.
+                if !suppress_images
+                    && let LineMeta::Image {
+                        ref url,
+                        row: image_row,
+                        ..
+                    } = line.meta
+                    && state.image_cache.is_ready_to_render(url)
+                {
+                    drew_inline_image = state.image_cache.render_image_row(
                         stdout,
-                        SetForegroundColor(theme.image_fg),
-                        SetAttribute(Attribute::Dim),
-                        Print(" ".repeat(pad)),
-                        Print(&label),
-                        Print(" ".repeat(content_width.saturating_sub(pad + label_len))),
-                        SetAttribute(Attribute::Reset),
-                        SetBackgroundColor(theme.bg),
-                    )?;
-                } else {
-                    queue!(
-                        stdout,
-                        SetBackgroundColor(theme.bg),
-                        Print(" ".repeat(content_width)),
-                        SetAttribute(Attribute::Reset),
+                        url,
+                        image_row,
+                        content_width,
+                        theme.bg,
                     )?;
                 }
-                drew_inline_image = true;
-            }
 
-            if !drew_inline_image {
-                // JSON cursor highlight (skip in diagram mode — cards handle their own highlight)
-                let is_json_cursor = state
-                    .json_view
-                    .as_ref()
-                    .and_then(|jv| {
-                        if jv.diagram_mode {
-                            return None;
-                        }
-                        jv.cursor_line()
-                    })
-                    .is_some_and(|cl| cl == line_idx);
-                let line_bg = if is_json_cursor {
-                    theme.overlay_selected_bg
-                } else {
-                    theme.bg
-                };
-                if is_json_cursor {
-                    queue!(stdout, SetBackgroundColor(line_bg))?;
-                }
-
-                let highlights = if !state.slide_mode {
-                    state.search.highlights_for_line(line_idx)
-                } else {
-                    vec![]
-                };
-                let highlighted;
-                let spans: &[StyledSpan] = if highlights.is_empty() {
-                    &line.spans
-                } else {
-                    highlighted = apply_search_highlights(&line.spans, &highlights, theme);
-                    &highlighted
-                };
-
-                let mut col = 0;
-                for span in spans {
-                    write_span(stdout, span, Some(line_bg))?;
-                    col += UnicodeWidthStr::width(span.text.as_str());
-                }
-                if col < content_width {
-                    let fill_bg = if is_json_cursor {
-                        Some(line_bg)
-                    } else {
-                        line.spans.first().and_then(|s| s.style.bg).and_then(|bg| {
-                            if line.spans.iter().all(|s| s.style.bg == Some(bg)) {
-                                Some(bg)
-                            } else {
-                                None
-                            }
-                        })
-                    };
-                    if let Some(bg) = fill_bg {
+                // Render placeholder for images not yet ready (loading or pre-rendering)
+                if !drew_inline_image
+                    && let LineMeta::Image {
+                        ref url,
+                        ref alt,
+                        row: image_row,
+                        ..
+                    } = line.meta
+                    && !state.image_cache.is_ready_to_render(url)
+                {
+                    if image_row == 0 {
+                        let label_text = if alt.is_empty() {
+                            url.as_str()
+                        } else {
+                            alt.as_str()
+                        };
+                        let prefix = "[ Loading: ";
+                        let suffix = " ]";
+                        let max_inner = content_width.saturating_sub(prefix.len() + suffix.len());
+                        let truncated: String = label_text.chars().take(max_inner).collect();
+                        let label = format!("{prefix}{truncated}{suffix}");
+                        let label_len = label.chars().count();
+                        let pad = content_width.saturating_sub(label_len) / 2;
                         queue!(
                             stdout,
-                            SetBackgroundColor(bg),
-                            Print(" ".repeat(content_width - col)),
+                            SetForegroundColor(theme.image_fg),
+                            SetAttribute(Attribute::Dim),
+                            Print(" ".repeat(pad)),
+                            Print(&label),
+                            Print(" ".repeat(content_width.saturating_sub(pad + label_len))),
                             SetAttribute(Attribute::Reset),
                             SetBackgroundColor(theme.bg),
                         )?;
                     } else {
-                        queue!(stdout, Print(" ".repeat(content_width - col)))?;
+                        queue!(
+                            stdout,
+                            SetBackgroundColor(theme.bg),
+                            Print(" ".repeat(content_width)),
+                            SetAttribute(Attribute::Reset),
+                        )?;
                     }
+                    drew_inline_image = true;
                 }
-                if is_json_cursor {
-                    queue!(stdout, SetBackgroundColor(theme.bg))?;
+
+                if !drew_inline_image {
+                    // JSON cursor highlight (skip in diagram mode — cards handle their own highlight)
+                    let is_json_cursor = state
+                        .json_view
+                        .as_ref()
+                        .and_then(|jv| {
+                            if jv.diagram_mode {
+                                return None;
+                            }
+                            jv.cursor_line()
+                        })
+                        .is_some_and(|cl| cl == line_idx);
+                    let line_bg = if is_json_cursor {
+                        theme.overlay_selected_bg
+                    } else {
+                        theme.bg
+                    };
+                    if is_json_cursor {
+                        queue!(stdout, SetBackgroundColor(line_bg))?;
+                    }
+
+                    let highlights = if !state.slide_mode {
+                        state.search.highlights_for_line(line_idx)
+                    } else {
+                        vec![]
+                    };
+                    let highlighted;
+                    let spans: &[StyledSpan] = if highlights.is_empty() {
+                        &line.spans
+                    } else {
+                        highlighted = apply_search_highlights(&line.spans, &highlights, theme);
+                        &highlighted
+                    };
+
+                    let mut col = 0;
+                    for span in spans {
+                        write_span(stdout, span, Some(line_bg))?;
+                        col += UnicodeWidthStr::width(span.text.as_str());
+                    }
+                    if col < content_width {
+                        let fill_bg = if is_json_cursor {
+                            Some(line_bg)
+                        } else {
+                            line.spans.first().and_then(|s| s.style.bg).and_then(|bg| {
+                                if line.spans.iter().all(|s| s.style.bg == Some(bg)) {
+                                    Some(bg)
+                                } else {
+                                    None
+                                }
+                            })
+                        };
+                        if let Some(bg) = fill_bg {
+                            queue!(
+                                stdout,
+                                SetBackgroundColor(bg),
+                                Print(" ".repeat(content_width - col)),
+                                SetAttribute(Attribute::Reset),
+                                SetBackgroundColor(theme.bg),
+                            )?;
+                        } else {
+                            queue!(stdout, Print(" ".repeat(content_width - col)))?;
+                        }
+                    }
+                    if is_json_cursor {
+                        queue!(stdout, SetBackgroundColor(theme.bg))?;
+                    }
                 }
             }
         } else {
@@ -2749,15 +2816,38 @@ fn render_status_bar(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result
 
     if state.slide_mode {
         let num_slides = state.slide_boundaries.len().max(1);
+
+        // Calculate current line range being displayed (per-slide)
+        let slide_start = state
+            .slide_boundaries
+            .get(state.current_slide)
+            .copied()
+            .unwrap_or(0);
+        let slide_end = state
+            .slide_boundaries
+            .get(state.current_slide + 1)
+            .copied()
+            .unwrap_or(state.wrapped.len());
+        let slide_height = slide_end - slide_start;
+        let first_visible = state.slide_offset + 1; // 1-indexed, per-slide
+        let last_visible = (first_visible + viewport - 1).min(slide_height);
+        let total_lines = slide_height;
+
+        let lines_label = format!(" Lines {}-{}/{} ", first_visible, last_visible, total_lines);
+        let lines_len = lines_label.chars().count();
+
         let slide_label = format!(" Slide {}/{} ", state.current_slide + 1, num_slides);
         let slide_len = slide_label.chars().count();
+
         let hint = " ←/→ navigate · t theme ";
         let hint_len = hint.chars().count();
-        let needed = 4 + slide_len + hint_len;
+
+        let needed = 4 + lines_len + slide_len + hint_len;
         let (show_hint, fill) = if width > needed {
             (true, width - needed)
         } else {
-            (false, width.saturating_sub(4 + slide_len))
+            let needed_no_hint = 4 + lines_len + slide_len;
+            (false, width.saturating_sub(needed_no_hint))
         };
 
         queue!(
@@ -2774,6 +2864,8 @@ fn render_status_bar(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result
             stdout,
             SetForegroundColor(theme.border),
             Print("─".repeat(fill)),
+            SetForegroundColor(theme.position),
+            Print(&lines_label),
             SetForegroundColor(theme.slide_indicator),
             Print(&slide_label),
             SetForegroundColor(theme.border),
@@ -2919,6 +3011,13 @@ fn render_status_bar(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result
     let pos_label = format!(" {} ", position);
     let pos_len = pos_label.chars().count();
 
+    // Calculate absolute line range
+    let first_visible = state.offset + 1; // 1-indexed
+    let last_visible = (state.offset + viewport).min(state.wrapped.len());
+    let total_lines = state.wrapped.len();
+    let lines_label = format!(" Lines {}-{}/{} ", first_visible, last_visible, total_lines);
+    let lines_len = lines_label.chars().count();
+
     let pending = state.image_cache.in_flight_count();
     let loading_label = if pending > 0 {
         let noun = if pending == 1 { "image" } else { "images" };
@@ -2930,11 +3029,14 @@ fn render_status_bar(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result
 
     let hint = " / search · o toc · f links · t theme · F1 help ";
     let hint_len = hint.chars().count();
-    let needed = 4 + hint_len + loading_len + pos_len;
+    let needed = 4 + hint_len + loading_len + lines_len + pos_len;
     let (show_hint, fill) = if width > needed {
         (true, width - needed)
     } else {
-        (false, width.saturating_sub(4 + loading_len + pos_len))
+        (
+            false,
+            width.saturating_sub(4 + loading_len + lines_len + pos_len),
+        )
     };
 
     queue!(
@@ -2965,6 +3067,7 @@ fn render_status_bar(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result
     queue!(
         stdout,
         SetForegroundColor(theme.position),
+        Print(&lines_label),
         Print(&pos_label),
         SetForegroundColor(theme.border),
         Print("─╯"),

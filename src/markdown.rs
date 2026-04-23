@@ -19,6 +19,8 @@ struct Renderer<'a> {
     current_spans: Vec<StyledSpan>,
     width: usize,
     line_numbers: bool,
+    slide_mode: bool,
+    at_slide_start: bool, // True at document start or right after a slide break
 
     // Inline style state
     bold: bool,
@@ -82,6 +84,7 @@ impl<'a> Renderer<'a> {
         width: usize,
         theme: &'a Theme,
         line_numbers: bool,
+        slide_mode: bool,
         syntax_set: &'a SyntaxSet,
         theme_set: &'a ThemeSet,
     ) -> Self {
@@ -91,6 +94,8 @@ impl<'a> Renderer<'a> {
             current_spans: Vec::new(),
             width,
             line_numbers,
+            slide_mode,
+            at_slide_start: true, // Start at beginning of document
             bold: false,
             italic: false,
             strikethrough: false,
@@ -711,9 +716,15 @@ impl<'a> Renderer<'a> {
             }
 
             Event::Start(Tag::Heading { level, .. }) => {
-                if !self.lines.is_empty() {
+                // Skip separator for first heading on a slide
+                let should_skip_separator = self.slide_mode && self.at_slide_start;
+
+                if !self.lines.is_empty() && !should_skip_separator {
                     if matches!(level, HeadingLevel::H1 | HeadingLevel::H2) {
-                        self.push_empty_line();
+                        // In slide mode, use compact spacing around heading separators
+                        if !self.slide_mode {
+                            self.push_empty_line();
+                        }
                         self.lines.push(Line {
                             spans: vec![StyledSpan {
                                 text: "─".repeat(self.width.min(60)),
@@ -725,11 +736,14 @@ impl<'a> Renderer<'a> {
                             }],
                             meta: LineMeta::None,
                         });
-                        self.push_empty_line();
+                        if !self.slide_mode {
+                            self.push_empty_line();
+                        }
                     } else {
                         self.push_empty_line();
                     }
                 }
+                self.at_slide_start = false; // We're rendering content now
                 self.heading_level = Some(level);
                 self.heading_text.clear();
                 match level {
@@ -1094,6 +1108,7 @@ impl<'a> Renderer<'a> {
                     meta: LineMeta::SlideBreak,
                 });
                 self.push_empty_line();
+                self.at_slide_start = true; // Next heading should not have separator
             }
 
             Event::TaskListMarker(checked) => {
@@ -1555,7 +1570,7 @@ pub fn render(
     line_numbers: bool,
 ) -> (Vec<Line>, DocumentInfo) {
     let res = SyntectRes::load();
-    render_with(input, width, theme, line_numbers, &res)
+    render_with(input, width, theme, line_numbers, false, &res)
 }
 
 pub fn render_with(
@@ -1563,6 +1578,7 @@ pub fn render_with(
     width: usize,
     theme: &Theme,
     line_numbers: bool,
+    slide_mode: bool,
     syntect_res: &SyntectRes,
 ) -> (Vec<Line>, DocumentInfo) {
     let mut renderer = Renderer::new(
@@ -1570,6 +1586,7 @@ pub fn render_with(
         width,
         theme,
         line_numbers,
+        slide_mode,
         &syntect_res.syntax_set,
         &syntect_res.theme_set,
     );
