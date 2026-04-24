@@ -25,7 +25,7 @@
 * slide 1
 * slide 1
 * slide 1
-* slide 1
+* slide 1 a long line that will wrap a long line that will wrap a long line that will wrap a long line that will wrap a long line that will wrap a long line that will wrap a long line that will wrap a long line that will wrap
 * slide 1
 * slide 1
 * slide 1

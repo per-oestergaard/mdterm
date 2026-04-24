@@ -267,6 +267,66 @@ pub fn to_svg_string(lines: &[crate::style::Line], width: usize, theme: &Theme) 
             continue;
         }
 
+        // Box-drawing lines (table/code borders) are rendered as SVG <rect>s
+        // rather than font glyphs so they tile with zero gaps regardless of font.
+        if is_box_drawing_line(line) {
+            let bar_t = (LINE_HEIGHT * 0.07).max(2.0);
+            let mid_y = y_top + LINE_HEIGHT * 0.5;
+            let color = line
+                .spans
+                .iter()
+                .find_map(|s| s.style.fg)
+                .unwrap_or(theme.fg);
+            let fill = color_css(color);
+            let mut cx = PAD;
+            for span in &line.spans {
+                for ch in span.text.chars() {
+                    let (hl, hr, vu, vd) = box_char_dirs(ch);
+                    let char_mid_x = cx + CHAR_WIDTH * 0.5;
+                    // horizontal segments
+                    if hl {
+                        let _ = write!(svg,
+                            r#"<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{fill}"/>"#,
+                            x = cx as u32,
+                            y = (mid_y - bar_t / 2.0) as u32,
+                            w = (CHAR_WIDTH / 2.0).ceil() as u32,
+                            h = bar_t.ceil() as u32,
+                            fill = fill);
+                    }
+                    if hr {
+                        let _ = write!(svg,
+                            r#"<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{fill}"/>"#,
+                            x = (cx + CHAR_WIDTH / 2.0) as u32,
+                            y = (mid_y - bar_t / 2.0) as u32,
+                            w = (CHAR_WIDTH / 2.0).ceil() as u32,
+                            h = bar_t.ceil() as u32,
+                            fill = fill);
+                    }
+                    // vertical segments
+                    if vu {
+                        let _ = write!(svg,
+                            r#"<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{fill}"/>"#,
+                            x = (char_mid_x - bar_t / 2.0) as u32,
+                            y = y_top as u32,
+                            w = bar_t.ceil() as u32,
+                            h = (LINE_HEIGHT / 2.0).ceil() as u32,
+                            fill = fill);
+                    }
+                    if vd {
+                        let _ = write!(svg,
+                            r#"<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{fill}"/>"#,
+                            x = (char_mid_x - bar_t / 2.0) as u32,
+                            y = (y_top + LINE_HEIGHT / 2.0) as u32,
+                            w = bar_t.ceil() as u32,
+                            h = (LINE_HEIGHT / 2.0).ceil() as u32,
+                            fill = fill);
+                    }
+                    cx += CHAR_WIDTH;
+                }
+            }
+            continue;
+        }
+
         // Text + tspans — each tspan gets an explicit x so wide/emoji chars
         // (which fall back to a non-monospace font) cannot shift subsequent spans.
         let _ = write!(
@@ -312,6 +372,31 @@ pub fn to_svg_string(lines: &[crate::style::Line], width: usize, theme: &Theme) 
 
     let _ = write!(svg, "</svg>");
     svg
+}
+
+/// Returns true if every non-space character in the line is a box-drawing glyph.
+/// Used by `to_svg_string` to switch to rect-based rendering for table borders.
+fn is_box_drawing_line(line: &crate::style::Line) -> bool {
+    line.spans.iter().all(|s| s.text.chars().all(|c| matches!(c, ' ' | '─' | '│' | '╭' | '╮' | '╰' | '╯' | '├' | '┤' | '┬' | '┴' | '┼')))
+        && line.spans.iter().any(|s| s.text.chars().any(|c| c != ' '))
+}
+
+/// Returns which sides of a cell a box-drawing char connects to: (left, right, up, down).
+fn box_char_dirs(c: char) -> (bool, bool, bool, bool) {
+    match c {
+        '─' => (true,  true,  false, false),
+        '│' => (false, false, true,  true ),
+        '╭' => (false, true,  false, true ),  // arc: down + right
+        '╮' => (true,  false, false, true ),  // arc: down + left
+        '╰' => (false, true,  true,  false),  // arc: up   + right
+        '╯' => (true,  false, true,  false),  // arc: up   + left
+        '├' => (false, true,  true,  true ),
+        '┤' => (true,  false, true,  true ),
+        '┬' => (true,  true,  false, true ),
+        '┴' => (true,  true,  true,  false),
+        '┼' => (true,  true,  true,  true ),
+        _   => (false, false, false, false),
+    }
 }
 
 /// Escape text content for safe embedding inside SVG.
@@ -409,8 +494,8 @@ pub fn export_slides_svg(
 /// `bg` is the theme background colour used to pre-fill the pixmap so that
 /// image viewers that don't handle alpha see the correct opaque background.
 fn svg_to_png(svg_str: &str, bg: Color) -> Vec<u8> {
-    use resvg::usvg;
     use resvg::tiny_skia;
+    use resvg::usvg;
 
     let mut opt = usvg::Options::default();
     // Load system fonts so that text elements are rendered correctly.
@@ -448,6 +533,53 @@ fn svg_to_png(svg_str: &str, bg: Color) -> Vec<u8> {
         tiny_skia::Transform::identity(),
         &mut pixmap.as_mut(),
     );
+
+    pixmap.encode_png().unwrap_or_else(|e| {
+        eprintln!("PNG encoding error: {}", e);
+        std::process::exit(1);
+    })
+}
+
+/// Rasterize an SVG string to a PNG at exactly `target_w × target_h` pixels.
+/// The SVG is scaled to fit within the target dimensions maintaining aspect
+/// ratio (letterboxed), with `bg` filling any unused area.
+fn svg_to_png_sized(svg_str: &str, bg: Color, target_w: u32, target_h: u32) -> Vec<u8> {
+    use resvg::tiny_skia;
+    use resvg::usvg;
+
+    let mut opt = usvg::Options::default();
+    opt.fontdb_mut().load_system_fonts();
+    let tree = match usvg::Tree::from_str(svg_str, &opt) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("SVG parse error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let mut pixmap = match tiny_skia::Pixmap::new(target_w, target_h) {
+        Some(p) => p,
+        None => {
+            eprintln!("Error: could not allocate {}×{} pixmap", target_w, target_h);
+            std::process::exit(1);
+        }
+    };
+
+    let (r, g, b) = match bg {
+        Color::Rgb { r, g, b } => (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0),
+        _ => (0.0, 0.0, 0.0),
+    };
+    pixmap.fill(tiny_skia::Color::from_rgba(r, g, b, 1.0).unwrap_or(tiny_skia::Color::BLACK));
+
+    // Scale to fit, maintaining aspect ratio (letterbox).
+    let svg_w = tree.size().width();
+    let svg_h = tree.size().height();
+    let scale = (target_w as f32 / svg_w).min(target_h as f32 / svg_h);
+    let tx = (target_w as f32 - svg_w * scale) / 2.0;
+    let ty = (target_h as f32 - svg_h * scale) / 2.0;
+    let transform = tiny_skia::Transform::from_row(scale, 0.0, 0.0, scale, tx, ty);
+
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
 
     pixmap.encode_png().unwrap_or_else(|e| {
         eprintln!("PNG encoding error: {}", e);
@@ -497,6 +629,250 @@ pub fn export_slides_png(
         }
         eprintln!("Wrote {}", path);
     }
+}
+
+// ── ODP export ───────────────────────────────────────────────────────────────
+
+/// Which image format to embed inside the ODP archive.
+pub enum OdpImageKind {
+    /// Embed SVG (default — smaller, vector, renders perfectly in LibreOffice).
+    Svg,
+    /// Embed rasterised PNG (1920×1080, compatible with PowerPoint and any ODP viewer).
+    Png,
+}
+
+/// Standard 16:9 widescreen presentation dimensions used for the ODP page layout.
+const PRES_W_CM: f64 = 25.4; // 10 inches
+const PRES_H_CM: f64 = 14.288; // 10 × 9/16 inches
+const PRES_PNG_W: u32 = 3840;
+const PRES_PNG_H: u32 = 2160;
+
+/// Export the document (or its slides) as a single ODP file.
+///
+/// Each slide is rendered to an SVG/PNG in memory and stored in the ZIP as
+/// `Pictures/slideNNNN.svg` / `.png`.  No temporary files are created.
+/// The ODP page size is always the standard 16:9 widescreen (25.4 × 14.29 cm)
+/// so the file opens correctly in LibreOffice, Nextcloud, and PowerPoint.
+pub fn export_odp(
+    content: &str,
+    width: usize,
+    theme: &Theme,
+    out_path: &str,
+    slide_mode: bool,
+    kind: OdpImageKind,
+) -> std::io::Result<()> {
+    use std::fs::File;
+    use std::io::{BufWriter, Write};
+    use zip::CompressionMethod;
+    use zip::write::SimpleFileOptions;
+
+    // ── 1. Render markdown → slides ──────────────────────────────────────
+    let (lines, _) = markdown::render(content, width, theme, false);
+    let wrapped = crate::style::wrap_lines(&lines, width);
+    let ranges = if slide_mode {
+        slide_ranges(&wrapped)
+    } else {
+        vec![(0, wrapped.len())]
+    };
+
+    // ── 2. Build per-slide image bytes (in memory) ───────────────────────
+    let ext = match kind {
+        OdpImageKind::Svg => "svg",
+        OdpImageKind::Png => "png",
+    };
+
+    // Compute the tallest slide so every slide SVG has the same height,
+    // matching the fixed page dimensions exactly (no stretching in viewers).
+    let max_lines = ranges.iter().map(|(s, e)| e - s).max().unwrap_or(1).max(1);
+
+    let mut slide_images: Vec<Vec<u8>> = Vec::with_capacity(ranges.len());
+    for (start, end) in &ranges {
+        // Exclude trailing SlideBreak lines from the rendered image.
+        let raw = &wrapped[*start..*end];
+        let trimmed_end = raw
+            .iter()
+            .rposition(|l| !matches!(l.meta, crate::style::LineMeta::SlideBreak))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let slide_lines = &raw[..trimmed_end];
+
+        // Pad with empty lines so every slide SVG has exactly max_lines rows,
+        // ensuring the SVG dimensions match the fixed page layout.
+        let padding = max_lines.saturating_sub(slide_lines.len());
+        let mut padded: Vec<crate::style::Line>;
+        let lines_for_svg: &[crate::style::Line] = if padding > 0 {
+            padded = slide_lines.to_vec();
+            padded.extend((0..padding).map(|_| crate::style::Line::empty()));
+            &padded
+        } else {
+            slide_lines
+        };
+
+        let svg = to_svg_string(lines_for_svg, width, theme);
+        let bytes: Vec<u8> = match kind {
+            OdpImageKind::Svg => svg.into_bytes(),
+            OdpImageKind::Png => svg_to_png_sized(&svg, theme.bg, PRES_PNG_W, PRES_PNG_H),
+        };
+        slide_images.push(bytes);
+    }
+
+    // ── 3. Build the ZIP (ODP archive) directly to file ──────────────────
+    if let Some(parent) = std::path::Path::new(out_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let file = File::create(out_path)?;
+    let writer = BufWriter::new(file);
+    let mut zip = zip::ZipWriter::new(writer);
+
+    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+
+    // mimetype MUST be the first entry and STORED (uncompressed) per ODF spec.
+    zip.start_file("mimetype", stored)?;
+    zip.write_all(b"application/vnd.oasis.opendocument.presentation")?;
+
+    // META-INF/manifest.xml
+    zip.start_file("META-INF/manifest.xml", deflated)?;
+    zip.write_all(build_manifest(ext, ranges.len()).as_bytes())?;
+
+    // styles.xml — page layout + master page (required by PowerPoint's ODP importer)
+    zip.start_file("styles.xml", deflated)?;
+    zip.write_all(build_styles_xml(PRES_W_CM, PRES_H_CM).as_bytes())?;
+
+    // content.xml — one <draw:page> per slide
+    zip.start_file("content.xml", deflated)?;
+    zip.write_all(build_content_xml(ext, ranges.len(), PRES_W_CM, PRES_H_CM).as_bytes())?;
+
+    // Pictures/slideNNNN.{svg|png}
+    for (idx, bytes) in slide_images.iter().enumerate() {
+        let name = format!("Pictures/slide{:04}.{}", idx + 1, ext);
+        zip.start_file(&name, deflated)?;
+        zip.write_all(bytes)?;
+    }
+
+    zip.finish()?;
+
+    eprintln!("Wrote {} ({} slide(s))", out_path, ranges.len());
+    Ok(())
+}
+
+/// Build the ODF manifest listing all entries in the archive.
+fn build_manifest(ext: &str, n_slides: usize) -> String {
+    use std::fmt::Write as FmtWrite;
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.3">
+ <manifest:file-entry manifest:full-path="/" manifest:media-type="application/vnd.oasis.opendocument.presentation"/>
+ <manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/>
+ <manifest:file-entry manifest:full-path="styles.xml" manifest:media-type="text/xml"/>"#
+    );
+    let mime = if ext == "svg" {
+        "image/svg+xml"
+    } else {
+        "image/png"
+    };
+    for i in 1..=n_slides {
+        let _ = writeln!(
+            s,
+            r#" <manifest:file-entry manifest:full-path="Pictures/slide{:04}.{}" manifest:media-type="{}"/>"#,
+            i, ext, mime
+        );
+    }
+    let _ = writeln!(s, "</manifest:manifest>");
+    s
+}
+
+/// Build styles.xml containing the page layout and master page definition.
+/// PowerPoint's ODP importer requires master-page to live in styles.xml,
+/// not content.xml.
+fn build_styles_xml(w_cm: f64, h_cm: f64) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<office:document-styles
+  xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+  xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+  xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"
+  xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+  xmlns:presentation="urn:oasis:names:tc:opendocument:xmlns:presentation:1.0"
+  office:version="1.3">
+ <office:styles/>
+ <office:automatic-styles>
+  <style:page-layout style:name="pl1">
+   <style:page-layout-properties fo:page-width="{w:.3}cm" fo:page-height="{h:.3}cm" style:print-orientation="landscape"/>
+  </style:page-layout>
+  <style:style style:name="dp1" style:family="drawing-page"/>
+ </office:automatic-styles>
+ <office:master-styles>
+  <style:master-page style:name="Default" style:page-layout-name="pl1" draw:style-name="dp1"/>
+ </office:master-styles>
+</office:document-styles>
+"#,
+        w = w_cm,
+        h = h_cm,
+    )
+}
+
+/// Build the ODF content.xml with one `<draw:page>` per slide.
+fn build_content_xml(ext: &str, n_slides: usize, w_cm: f64, h_cm: f64) -> String {
+    use std::fmt::Write as FmtWrite;
+
+    let wstr = format!("{:.3}cm", w_cm);
+    let hstr = format!("{:.3}cm", h_cm);
+
+    let mut s = String::new();
+
+    let _ = write!(
+        s,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content
+  xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+  xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+  xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+  xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+  xmlns:presentation="urn:oasis:names:tc:opendocument:xmlns:presentation:1.0"
+  xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"
+  xmlns:xlink="http://www.w3.org/1999/xlink"
+  xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+  office:version="1.3">
+ <office:automatic-styles>
+  <style:style style:name="gr1" style:family="graphic">
+   <style:graphic-properties style:protect="position size"/>
+  </style:style>
+ </office:automatic-styles>
+ <office:body>
+  <office:presentation>
+"#
+    );
+
+    for i in 1..=n_slides {
+        let href = format!("Pictures/slide{:04}.{}", i, ext);
+        let _ = write!(
+            s,
+            r#"   <draw:page draw:name="Slide{i}" draw:style-name="dp1" draw:master-page-name="Default">
+    <draw:frame draw:style-name="gr1" svg:x="0cm" svg:y="0cm" svg:width="{w}" svg:height="{h}">
+     <draw:image xlink:href="{href}" xlink:type="simple" xlink:show="embed" xlink:actuate="onLoad"/>
+    </draw:frame>
+   </draw:page>
+"#,
+            i = i,
+            w = wstr,
+            h = hstr,
+            href = href,
+        );
+    }
+
+    let _ = write!(
+        s,
+        r#"  </office:presentation>
+ </office:body>
+</office:document-content>
+"#
+    );
+    s
 }
 
 #[cfg(test)]

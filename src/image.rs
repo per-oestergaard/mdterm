@@ -1754,10 +1754,10 @@ fn terminology_path_safe(path: &str) -> bool {
 /// string, using `/dev/urandom` on Unix.
 /// Falls back to PID + timestamp if `/dev/urandom` is unavailable.
 fn random_hex_suffix() -> String {
-    let  mut buf = [0u8; 8];
 
     #[cfg(unix)]
     {
+        let  mut buf = [0u8; 8];
         use std::io::Read;
         if let Ok(mut f) = std::fs::File::open("/dev/urandom")
             && f.read_exact(&mut buf).is_ok()

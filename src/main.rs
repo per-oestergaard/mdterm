@@ -43,7 +43,7 @@ struct Cli {
     #[arg(long, short = 'l')]
     line_numbers: bool,
 
-    /// Export format instead of interactive view (html, svg, png)
+    /// Export format instead of interactive view (html, svg, png, odp, odp+svg, odp+png)
     #[arg(long)]
     export: Option<String>,
 
@@ -52,6 +52,11 @@ struct Cli {
     /// Files are written as <prefix>0001.svg / <prefix>0001.png etc.
     #[arg(long)]
     export_prefix: Option<String>,
+
+    /// Output file path for single-file exports (e.g. ./out/presentation.odp)
+    /// Required with --export odp / odp+svg / odp+png.
+    #[arg(long)]
+    export_file: Option<String>,
 
     /// Disable colors
     #[arg(long)]
@@ -131,17 +136,47 @@ fn main() {
                     export::export_slides_png(&content, w, &initial_theme, prefix, cli.slides);
                 }
             }
+            "odp" | "odp+svg" | "odp+png" => {
+                let out_file = cli.export_file.as_deref().unwrap_or_else(|| {
+                    eprintln!("Error: --export-file is required with --export {}", fmt);
+                    process::exit(1);
+                });
+                let w = if width > 0 { width } else { 120 };
+                let kind = if fmt == "odp+png" {
+                    export::OdpImageKind::Png
+                } else {
+                    export::OdpImageKind::Svg
+                };
+                if fmt != "odp+png" {
+                    eprintln!(
+                        "Note: SVG-based ODP may not open in PowerPoint. Use --export odp+png for PowerPoint compatibility."
+                    );
+                }
+                if let Err(e) =
+                    export::export_odp(&content, w, &initial_theme, out_file, cli.slides, kind)
+                {
+                    eprintln!("Error writing '{}': {}", out_file, e);
+                    process::exit(1);
+                }
+            }
             _ => {
-                eprintln!("Unknown export format '{}'. Supported: html, svg, png", fmt);
+                eprintln!(
+                    "Unknown export format '{}'. Supported: html, svg, png, odp, odp+svg, odp+png",
+                    fmt
+                );
                 process::exit(1);
             }
         }
         return;
     }
 
-    // --export-prefix without --export is an error
+    // --export-prefix / --export-file without --export is an error
     if cli.export_prefix.is_some() {
         eprintln!("Error: --export-prefix requires --export svg or --export png");
+        process::exit(1);
+    }
+    if cli.export_file.is_some() {
+        eprintln!("Error: --export-file requires --export odp / odp+svg / odp+png");
         process::exit(1);
     }
 

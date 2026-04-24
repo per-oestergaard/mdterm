@@ -122,16 +122,58 @@ pub fn wrap_lines(lines: &[Line], width: usize) -> Vec<Line> {
                 w.meta = line.meta.clone();
                 result.push(w);
             }
+        } else if matches!(line.meta, LineMeta::ListItem { .. } | LineMeta::TaskItem { .. }) {
+            // List items: wrap with hanging indent so continuation lines align
+            // with the text start, not the bullet.  TaskItem has two prefix
+            // spans (indent + marker); ListItem has one (the bullet span).
+            let prefix_spans = match &line.meta {
+                LineMeta::TaskItem { .. } => 2_usize.min(line.spans.len()),
+                _ => 1_usize.min(line.spans.len()),
+            };
+            let prefix_w: usize = line
+                .spans
+                .iter()
+                .take(prefix_spans)
+                .map(|s| UnicodeWidthStr::width(s.text.as_str()))
+                .sum();
+            let inner_width = width.saturating_sub(prefix_w);
+            // Only apply hanging indent when there are real content spans after
+            // the prefix spans (the real markdown renderer always splits them).
+            // If the whole line is one span, fall back to generic wrapping.
+            if inner_width == 0 || prefix_w == 0 || prefix_spans >= line.spans.len() {
+                let mut wrapped = word_wrap(line, width);
+                for w in &mut wrapped {
+                    w.meta = line.meta.clone();
+                }
+                result.extend(wrapped);
+                continue;
+            }
+            let content_line = Line {
+                spans: line.spans.iter().skip(prefix_spans).cloned().collect(),
+                meta: LineMeta::None,
+            };
+            let mut wrapped = word_wrap(&content_line, inner_width);
+            let indent_span = StyledSpan {
+                text: " ".repeat(prefix_w),
+                style: Style::default(),
+            };
+            for (i, w) in wrapped.iter_mut().enumerate() {
+                if i == 0 {
+                    for ps in line.spans.iter().take(prefix_spans).rev() {
+                        w.spans.insert(0, ps.clone());
+                    }
+                } else {
+                    w.spans.insert(0, indent_span.clone());
+                }
+                w.meta = line.meta.clone();
+            }
+            result.extend(wrapped);
         } else {
             let mut wrapped = word_wrap(line, width);
             // Propagate metadata to all wrapped lines for clickable types
-            // (ListItem, Heading) so click-to-copy works on continuation lines.
+            // (Heading) so click-to-copy works on continuation lines.
             // Other types only propagate to the first line.
-            let propagate_all = matches!(
-                line.meta,
-                LineMeta::ListItem { .. } | LineMeta::TaskItem { .. } | LineMeta::Heading { .. }
-            );
-            if propagate_all {
+            if matches!(line.meta, LineMeta::Heading { .. }) {
                 for w in &mut wrapped {
                     w.meta = line.meta.clone();
                 }
