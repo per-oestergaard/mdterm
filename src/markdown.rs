@@ -834,7 +834,7 @@ impl<'a> Renderer<'a> {
             Event::Start(Tag::BlockQuote(_)) => {
                 self.in_blockquote = true;
             }
-            Event::End(TagEnd::BlockQuote) => {
+            Event::End(TagEnd::BlockQuote(_)) => {
                 self.in_blockquote = false;
                 // Remove trailing bar-only empty line left by paragraph end
                 if let Some(last) = self.lines.last() {

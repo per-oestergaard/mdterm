@@ -122,7 +122,10 @@ pub fn wrap_lines(lines: &[Line], width: usize) -> Vec<Line> {
                 w.meta = line.meta.clone();
                 result.push(w);
             }
-        } else if matches!(line.meta, LineMeta::ListItem { .. } | LineMeta::TaskItem { .. }) {
+        } else if matches!(
+            line.meta,
+            LineMeta::ListItem { .. } | LineMeta::TaskItem { .. }
+        ) {
             // List items: wrap with hanging indent so continuation lines align
             // with the text start, not the bullet.  TaskItem has two prefix
             // spans (indent + marker); ListItem has one (the bullet span).

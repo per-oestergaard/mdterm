@@ -132,79 +132,118 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-/// Strip all ASCII control characters (0x00–0x1F, 0x7F) that browsers silently
-/// ignore when parsing URL schemes, which could bypass scheme checks.
-/// Tabs, newlines, and carriage returns are also stripped because the URL
-/// standard removes them before scheme matching.
-fn strip_control_chars(s: &str) -> String {
+/// Strip C0 control characters before handing a string to the URL parser.
+///
+/// Several browsers silently ignore C0 controls (U+0000–U+001F) when matching
+/// URL schemes, so `"java\x01script:"` would reach the DOM as `"javascript:"`.
+/// The WHATWG URL standard strips only tabs and newlines; we strip all C0
+/// controls to be safe against every browser quirk.
+fn strip_url_controls(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// Returns true if the URL scheme is safe for use in `<a href>`.
-fn is_safe_url(url: &str) -> bool {
-    let cleaned = strip_control_chars(url);
-    let trimmed = cleaned.trim();
-    let lower = trimmed.to_lowercase();
-    // Allow common safe schemes, anchors, and relative paths
-    if lower.starts_with("http://")
-        || lower.starts_with("https://")
-        || lower.starts_with("mailto:")
-        || trimmed.starts_with('#')
-    {
+///
+/// Uses an **allowlist** — only `http`, `https`, `mailto`, anchors (`#…`),
+/// and scheme-less relative paths are permitted.  Any scheme not on the list
+/// (including `javascript:`, `vbscript:`, `data:`, `blob:`, `ws:`, …) is
+/// blocked.  URL parsing is delegated to the `url` crate (WHATWG-compliant)
+/// so there is no hand-rolled scheme extraction to get wrong.
+fn is_safe_url(raw: &str) -> bool {
+    use url::Url;
+    let s = strip_url_controls(raw);
+    let s = s.trim();
+    if s.is_empty() || s.starts_with('#') {
         return true;
     }
-    // Block known dangerous schemes
-    if lower.starts_with("javascript:")
-        || lower.starts_with("vbscript:")
-        || lower.starts_with("data:")
-    {
-        return false;
+    match Url::parse(s) {
+        Ok(u) => matches!(u.scheme(), "http" | "https" | "mailto"),
+        // Not an absolute URL — safe if there is no scheme-like prefix.
+        Err(_) => !s.split('/').next().unwrap_or("").contains(':'),
     }
-    // Allow relative paths (no colon before first slash)
-    !lower.split('/').next().unwrap_or("").contains(':')
 }
 
 /// Returns true if the URL is safe for use in `<img src>`.
-fn is_safe_img_src(url: &str) -> bool {
-    let cleaned = strip_control_chars(url);
-    let trimmed = cleaned.trim();
-    let lower = trimmed.to_lowercase();
-    if lower.starts_with("http://") || lower.starts_with("https://") {
+///
+/// Allowlist: `http`/`https` and a small set of raster-only `data:` image
+/// MIME types.  SVG data URIs are excluded because they can carry scripts.
+/// Any unrecognised scheme is blocked.
+fn is_safe_img_src(raw: &str) -> bool {
+    use url::Url;
+    let s = strip_url_controls(raw);
+    let s = s.trim();
+    if s.is_empty() {
         return true;
     }
-    // Allow only specific raster image data URIs (MIME must be followed by `;` or `,`)
-    let safe_data_prefixes = [
-        "data:image/png",
-        "data:image/jpeg",
-        "data:image/gif",
-        "data:image/webp",
-        "data:image/bmp",
-    ];
-    for prefix in &safe_data_prefixes {
-        if let Some(rest) = lower.strip_prefix(prefix)
-            && (rest.starts_with(';') || rest.starts_with(','))
-        {
-            return true;
-        }
+    match Url::parse(s) {
+        Ok(u) => match u.scheme() {
+            "http" | "https" => true,
+            "data" => {
+                // u.path() returns the opaque path after "data:" — e.g.
+                // "image/png;base64,…" for "data:image/png;base64,…".
+                // SVG is intentionally absent: it can carry inline scripts.
+                const SAFE_IMG_MIMES: &[&str] = &[
+                    "image/png",
+                    "image/jpeg",
+                    "image/gif",
+                    "image/webp",
+                    "image/bmp",
+                ];
+                let path = u.path();
+                SAFE_IMG_MIMES.iter().any(|mime| {
+                    path.starts_with(mime) && path[mime.len()..].starts_with([';', ','])
+                })
+            }
+            _ => false,
+        },
+        // Not an absolute URL — safe if there is no scheme-like prefix.
+        Err(_) => !s.split('/').next().unwrap_or("").contains(':'),
     }
-    // Block dangerous schemes
-    if lower.starts_with("javascript:")
-        || lower.starts_with("vbscript:")
-        || lower.starts_with("data:")
-    {
-        return false;
-    }
-    // Allow relative paths
-    !lower.split('/').next().unwrap_or("").contains(':')
 }
 
 // ── SVG / PNG export ────────────────────────────────────────────────────────
 
-/// Character cell metrics used when building the SVG viewport (3× scale).
-const CHAR_WIDTH: f64 = 28.8;
-const LINE_HEIGHT: f64 = 60.0;
-const FONT_SIZE: f64 = 48.0;
-const PAD: f64 = 60.0;
+/// All character-cell and rendering metrics used when building the SVG viewport.
+///
+/// Values are tuned for Courier New / DejaVu Sans Mono at 3× terminal scale.
+/// Change a field here and the entire SVG renderer adjusts consistently.
+struct SvgMetrics {
+    /// Width of one monospace character cell in SVG user units (pixels).
+    char_width: f64,
+    /// Height of one line (cell) in SVG user units.
+    line_height: f64,
+    /// Font-size passed to the SVG `<style>` block.
+    font_size: f64,
+    /// Uniform padding (top / bottom / left / right) around the content area.
+    pad: f64,
+    /// Fraction of `line_height` from the top of a cell to the text baseline.
+    baseline_ratio: f64,
+    /// Thickness of box-drawing rule rects as a fraction of `line_height`.
+    /// A ratio keeps rules proportional when `line_height` is changed.
+    box_bar_ratio: f64,
+}
+
+const METRICS: SvgMetrics = SvgMetrics {
+    char_width: 28.8,
+    line_height: 60.0,
+    font_size: 48.0,
+    pad: 60.0,
+    baseline_ratio: 0.78,
+    box_bar_ratio: 0.07,
+};
+
+impl SvgMetrics {
+    /// Half the width of one character cell — the x-distance from the left
+    /// edge of a cell to its centre, and the width of each half-segment.
+    const fn half_char_width(&self) -> f64 {
+        self.char_width / 2.0
+    }
+    /// Half the height of one line cell — the y-distance from the top of a
+    /// cell to its centre, and the height of each half-segment.
+    const fn half_line_height(&self) -> f64 {
+        self.line_height / 2.0
+    }
+}
 
 /// Render a slice of `Line`s to a self-contained SVG string.
 /// Each `StyledSpan` becomes a `<tspan>` with the correct colours and
@@ -212,9 +251,11 @@ const PAD: f64 = 60.0;
 pub fn to_svg_string(lines: &[crate::style::Line], width: usize, theme: &Theme) -> String {
     use std::fmt::Write as FmtWrite;
 
-    let svg_w = width as f64 * CHAR_WIDTH + PAD * 2.0;
-    let svg_h = lines.len() as f64 * LINE_HEIGHT + PAD * 2.0;
+    let m = &METRICS;
+    let svg_w = width as f64 * m.char_width + m.pad * 2.0;
+    let svg_h = lines.len() as f64 * m.line_height + m.pad * 2.0;
 
+    // ── SVG envelope (write! for the structured header/footer) ──────────
     let mut svg = String::new();
     let _ = write!(
         svg,
@@ -222,208 +263,192 @@ pub fn to_svg_string(lines: &[crate::style::Line], width: usize, theme: &Theme) 
         w = svg_w as u32,
         h = svg_h as u32,
     );
-
-    // Background — use the theme's background colour so dark/light themes
-    // both render correctly.
-    let _ = write!(
-        svg,
-        r#"<rect width="{w}" height="{h}" fill="{bg}"/>"#,
-        w = svg_w as u32,
-        h = svg_h as u32,
-        bg = color_css(theme.bg),
-    );
-
-    // Font definition embedded once; DejaVu Sans Mono is the primary fallback
-    // for environments where Courier New is not installed.
+    // Background fills the whole canvas so dark/light themes both look correct.
+    let _ = write!(svg, r#"<rect width="{w}" height="{h}" fill="{bg}"/>"#,
+        w = svg_w as u32, h = svg_h as u32, bg = color_css(theme.bg));
+    // Embedded font definition — DejaVu Sans Mono is the fallback for systems
+    // without Courier New.
     let _ = write!(
         svg,
         r#"<style>text{{font-family:'Courier New','DejaVu Sans Mono',Courier,monospace;font-size:{fs}px;dominant-baseline:auto;}}</style>"#,
-        fs = FONT_SIZE as u32,
+        fs = m.font_size as u32,
     );
 
-    for (row, line) in lines.iter().enumerate() {
-        let y_top = PAD + row as f64 * LINE_HEIGHT;
-        let y_baseline = y_top + LINE_HEIGHT * 0.78; // ~78% from top = cap-height baseline
+    // ── Line bodies — purely functional pipeline ─────────────────────────
+    let body: String = lines
+        .iter()
+        .enumerate()
+        .map(|(row, line)| {
+            let y_top      = m.pad + row as f64 * m.line_height;
+            let y_baseline = y_top + m.line_height * m.baseline_ratio;
+            let bgs        = svg_bg_rects(line, y_top, m);
+            let content    = if line.spans.is_empty() {
+                String::new()
+            } else if is_box_drawing_line(line) {
+                svg_box_line(line, y_top, m, theme)
+            } else {
+                svg_text_line(line, y_baseline, m, theme)
+            };
+            bgs + &content
+        })
+        .collect();
 
-        // Background rects for spans that have a bg colour
-        let mut col: f64 = 0.0;
-        for span in &line.spans {
-            let span_w = UnicodeWidthStr::width(span.text.as_str()) as f64 * CHAR_WIDTH;
-            if let Some(bg) = span.style.bg {
-                let _ = write!(
-                    svg,
-                    r#"<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{fill}"/>"#,
-                    x = (PAD + col) as u32,
-                    y = y_top as u32,
-                    w = span_w as u32,
-                    h = LINE_HEIGHT as u32,
-                    fill = color_css(bg),
-                );
-            }
-            col += span_w;
-        }
-
-        if line.spans.is_empty() {
-            continue;
-        }
-
-        // Box-drawing lines (table/code borders) are rendered as SVG <rect>s
-        // rather than font glyphs so they tile with zero gaps regardless of font.
-        if is_box_drawing_line(line) {
-            let bar_t = (LINE_HEIGHT * 0.07).max(2.0);
-            let mid_y = y_top + LINE_HEIGHT * 0.5;
-            let color = line
-                .spans
-                .iter()
-                .find_map(|s| s.style.fg)
-                .unwrap_or(theme.fg);
-            let fill = color_css(color);
-            let mut cx = PAD;
-            for span in &line.spans {
-                for ch in span.text.chars() {
-                    let (hl, hr, vu, vd) = box_char_dirs(ch);
-                    let char_mid_x = cx + CHAR_WIDTH * 0.5;
-                    // horizontal segments
-                    if hl {
-                        let _ = write!(svg,
-                            r#"<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{fill}"/>"#,
-                            x = cx as u32,
-                            y = (mid_y - bar_t / 2.0) as u32,
-                            w = (CHAR_WIDTH / 2.0).ceil() as u32,
-                            h = bar_t.ceil() as u32,
-                            fill = fill);
-                    }
-                    if hr {
-                        let _ = write!(svg,
-                            r#"<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{fill}"/>"#,
-                            x = (cx + CHAR_WIDTH / 2.0) as u32,
-                            y = (mid_y - bar_t / 2.0) as u32,
-                            w = (CHAR_WIDTH / 2.0).ceil() as u32,
-                            h = bar_t.ceil() as u32,
-                            fill = fill);
-                    }
-                    // vertical segments
-                    if vu {
-                        let _ = write!(svg,
-                            r#"<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{fill}"/>"#,
-                            x = (char_mid_x - bar_t / 2.0) as u32,
-                            y = y_top as u32,
-                            w = bar_t.ceil() as u32,
-                            h = (LINE_HEIGHT / 2.0).ceil() as u32,
-                            fill = fill);
-                    }
-                    if vd {
-                        let _ = write!(svg,
-                            r#"<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{fill}"/>"#,
-                            x = (char_mid_x - bar_t / 2.0) as u32,
-                            y = (y_top + LINE_HEIGHT / 2.0) as u32,
-                            w = bar_t.ceil() as u32,
-                            h = (LINE_HEIGHT / 2.0).ceil() as u32,
-                            fill = fill);
-                    }
-                    cx += CHAR_WIDTH;
-                }
-            }
-            continue;
-        }
-
-        // Text + tspans — each tspan gets an explicit x so wide/emoji chars
-        // (which fall back to a non-monospace font) cannot shift subsequent spans.
-        let _ = write!(
-            svg,
-            r#"<text y="{y}" xml:space="preserve">"#,
-            y = y_baseline as u32,
-        );
-
-        let mut x_pos = PAD;
-        for span in &line.spans {
-            let span_w = UnicodeWidthStr::width(span.text.as_str()) as f64 * CHAR_WIDTH;
-            let mut attrs = String::new();
-            let _ = write!(attrs, r#" x="{}""#, x_pos as u32);
-            let fg = span.style.fg.unwrap_or(theme.fg);
-            let _ = write!(attrs, r#" fill="{}""#, color_css(fg));
-            if span.style.bold {
-                let _ = write!(attrs, r#" font-weight="bold""#);
-            }
-            if span.style.italic {
-                let _ = write!(attrs, r#" font-style="italic""#);
-            }
-            let mut decorations: Vec<&str> = Vec::new();
-            if span.style.underline {
-                decorations.push("underline");
-            }
-            if span.style.strikethrough {
-                decorations.push("line-through");
-            }
-            if !decorations.is_empty() {
-                let _ = write!(attrs, r#" text-decoration="{}""#, decorations.join(" "));
-            }
-            if span.style.dim {
-                let _ = write!(attrs, r#" opacity="0.5""#);
-            }
-            let _ = write!(svg, "<tspan{}>", attrs);
-            svg_escape_into(&mut svg, &span.text);
-            let _ = write!(svg, "</tspan>");
-            x_pos += span_w;
-        }
-
-        let _ = write!(svg, "</text>");
-    }
-
+    svg.push_str(&body);
     let _ = write!(svg, "</svg>");
     svg
+}
+
+/// Append a single `<rect>` element to an SVG string.
+/// `x`/`y` are floored to integer pixels; `w`/`h` are ceiling-rounded so
+/// adjacent rects share edges without leaving sub-pixel gaps.
+fn svg_rect(x: f64, y: f64, w: f64, h: f64, fill: &str) -> String {
+    format!(
+        r#"<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{fill}"/>"#,
+        x = x as u32,
+        y = y as u32,
+        w = w.ceil() as u32,
+        h = h.ceil() as u32,
+    )
 }
 
 /// Returns true if every non-space character in the line is a box-drawing glyph.
 /// Used by `to_svg_string` to switch to rect-based rendering for table borders.
 fn is_box_drawing_line(line: &crate::style::Line) -> bool {
-    line.spans.iter().all(|s| s.text.chars().all(|c| matches!(c, ' ' | '─' | '│' | '╭' | '╮' | '╰' | '╯' | '├' | '┤' | '┬' | '┴' | '┼')))
-        && line.spans.iter().any(|s| s.text.chars().any(|c| c != ' '))
+    line.spans.iter().all(|s| {
+        s.text.chars().all(|c| {
+            matches!(
+                c,
+                ' ' | '─' | '│' | '╭' | '╮' | '╰' | '╯' | '├' | '┤' | '┬' | '┴' | '┼'
+            )
+        })
+    }) && line.spans.iter().any(|s| s.text.chars().any(|c| c != ' '))
 }
 
-/// Returns which sides of a cell a box-drawing char connects to: (left, right, up, down).
-fn box_char_dirs(c: char) -> (bool, bool, bool, bool) {
-    match c {
-        '─' => (true,  true,  false, false),
-        '│' => (false, false, true,  true ),
-        '╭' => (false, true,  false, true ),  // arc: down + right
-        '╮' => (true,  false, false, true ),  // arc: down + left
-        '╰' => (false, true,  true,  false),  // arc: up   + right
-        '╯' => (true,  false, true,  false),  // arc: up   + left
-        '├' => (false, true,  true,  true ),
-        '┤' => (true,  false, true,  true ),
-        '┬' => (true,  true,  false, true ),
-        '┴' => (true,  true,  true,  false),
-        '┼' => (true,  true,  true,  true ),
-        _   => (false, false, false, false),
+/// Which sides of a character cell a box-drawing glyph connects to.
+struct BoxDirs {
+    left: bool,
+    right: bool,
+    up: bool,
+    down: bool,
+}
+
+/// Returns the connection directions for a box-drawing character.
+fn box_char_dirs(c: char) -> BoxDirs {
+    let (left, right, up, down) = match c {
+        '─' => (true, true, false, false),
+        '│' => (false, false, true, true),
+        '╭' => (false, true, false, true), // arc: down + right
+        '╮' => (true, false, false, true), // arc: down + left
+        '╰' => (false, true, true, false), // arc: up   + right
+        '╯' => (true, false, true, false), // arc: up   + left
+        '├' => (false, true, true, true),
+        '┤' => (true, false, true, true),
+        '┬' => (true, true, false, true),
+        '┴' => (true, true, true, false),
+        '┼' => (true, true, true, true),
+        _ => (false, false, false, false),
+    };
+    BoxDirs {
+        left,
+        right,
+        up,
+        down,
     }
 }
 
-/// Escape text content for safe embedding inside SVG.
-fn svg_escape_into(out: &mut String, s: &str) {
-    use std::fmt::Write as FmtWrite;
-    for c in s.chars() {
-        match c {
-            '&' => {
-                let _ = out.write_str("&amp;");
-            }
-            '<' => {
-                let _ = out.write_str("&lt;");
-            }
-            '>' => {
-                let _ = out.write_str("&gt;");
-            }
-            '"' => {
-                let _ = out.write_str("&quot;");
-            }
-            '\'' => {
-                let _ = out.write_str("&#39;");
-            }
-            c => {
-                let _ = out.write_char(c);
-            }
-        }
-    }
+/// Escape text content for safe embedding inside an SVG string.
+fn svg_escape(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '&'  => "&amp;".to_string(),
+            '<'  => "&lt;".to_string(),
+            '>'  => "&gt;".to_string(),
+            '"'  => "&quot;".to_string(),
+            '\'' => "&#39;".to_string(),
+            c    => c.to_string(),
+        })
+        .collect()
+}
+
+/// Build all background `<rect>` elements for spans that carry a bg colour.
+/// Uses `scan` to track the running x-offset without a separate mutable variable.
+fn svg_bg_rects(line: &crate::style::Line, y_top: f64, m: &SvgMetrics) -> String {
+    line.spans
+        .iter()
+        .scan(0.0_f64, |col, span| {
+            let span_w = UnicodeWidthStr::width(span.text.as_str()) as f64 * m.char_width;
+            let x = m.pad + *col;
+            *col += span_w;
+            Some((x, span_w, span.style.bg))
+        })
+        .filter_map(|(x, span_w, bg)| {
+            bg.map(|bg| svg_rect(x, y_top, span_w, m.line_height, &color_css(bg)))
+        })
+        .collect()
+}
+
+/// Build the SVG attribute string for one `<tspan>`.
+fn svg_tspan_attrs(span: &crate::style::StyledSpan, x_pos: f64, theme: &Theme) -> String {
+    let fg = color_css(span.style.fg.unwrap_or(theme.fg));
+    let weight    = span.style.bold   .then_some(r#" font-weight="bold""#).unwrap_or("");
+    let italic    = span.style.italic .then_some(r#" font-style="italic""#).unwrap_or("");
+    let dim       = span.style.dim    .then_some(r#" opacity="0.5""#).unwrap_or("");
+    let decoration = match (span.style.underline, span.style.strikethrough) {
+        (true,  true)  => r#" text-decoration="underline line-through""#,
+        (true,  false) => r#" text-decoration="underline""#,
+        (false, true)  => r#" text-decoration="line-through""#,
+        (false, false) => "",
+    };
+    format!(r#" x="{x}" fill="{fg}"{weight}{italic}{decoration}{dim}"#, x = x_pos as u32)
+}
+
+/// Render a line of styled text as `<text>…</text>` with one `<tspan>` per span.
+/// `scan` carries the x-position forward through the span iterator.
+fn svg_text_line(line: &crate::style::Line, y_baseline: f64, m: &SvgMetrics, theme: &Theme) -> String {
+    let tspans: String = line
+        .spans
+        .iter()
+        .scan(m.pad, |x_pos, span| {
+            let span_w = UnicodeWidthStr::width(span.text.as_str()) as f64 * m.char_width;
+            let attrs = svg_tspan_attrs(span, *x_pos, theme);
+            *x_pos += span_w;
+            Some(format!("<tspan{}>{}</tspan>", attrs, svg_escape(&span.text)))
+        })
+        .collect();
+    format!(
+        r#"<text y="{y}" xml:space="preserve">{tspans}</text>"#,
+        y = y_baseline as u32,
+    )
+}
+
+/// Render a box-drawing line as a series of pixel-perfect `<rect>` elements.
+/// Uses `flat_map` + `scan` so there are no mutable variables outside iterators.
+fn svg_box_line(line: &crate::style::Line, y_top: f64, m: &SvgMetrics, theme: &Theme) -> String {
+    let bar_t  = (m.line_height * m.box_bar_ratio).max(2.0);
+    let mid_y  = y_top + m.half_line_height();
+    let half_bar = bar_t * 0.5;
+    let fill = color_css(line.spans.iter().find_map(|s| s.style.fg).unwrap_or(theme.fg));
+
+    line.spans
+        .iter()
+        .flat_map(|s| s.text.chars().collect::<Vec<_>>())
+        .scan(m.pad, |cx, ch| {
+            let dirs       = box_char_dirs(ch);
+            let char_mid_x = *cx + m.half_char_width();
+            let rects: Vec<String> = [
+                dirs.left .then(|| svg_rect(*cx,                    mid_y - half_bar, m.half_char_width(), bar_t,             &fill)),
+                dirs.right.then(|| svg_rect(*cx + m.half_char_width(), mid_y - half_bar, m.half_char_width(), bar_t,          &fill)),
+                dirs.up   .then(|| svg_rect(char_mid_x - half_bar, y_top,             bar_t,             m.half_line_height(), &fill)),
+                dirs.down .then(|| svg_rect(char_mid_x - half_bar, y_top + m.half_line_height(), bar_t, m.half_line_height(), &fill)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            *cx += m.char_width;
+            Some(rects)
+        })
+        .flatten()
+        .collect()
 }
 
 /// Returns `(slide_start, slide_end)` index pairs into `wrapped` for each
@@ -641,11 +666,29 @@ pub enum OdpImageKind {
     Png,
 }
 
-/// Standard 16:9 widescreen presentation dimensions used for the ODP page layout.
-const PRES_W_CM: f64 = 25.4; // 10 inches
-const PRES_H_CM: f64 = 14.288; // 10 × 9/16 inches
-const PRES_PNG_W: u32 = 3840;
-const PRES_PNG_H: u32 = 2160;
+/// Physical dimensions and raster resolution for the ODP page layout.
+///
+/// All ODP slides use these values so they open correctly in LibreOffice,
+/// Nextcloud, and PowerPoint regardless of the terminal width used to render.
+struct PresLayout {
+    /// Slide width in centimetres (ODF page layout).
+    w_cm: f64,
+    /// Slide height in centimetres (ODF page layout).
+    h_cm: f64,
+    /// PNG raster width in pixels used for `odp+png` export.
+    png_w: u32,
+    /// PNG raster height in pixels used for `odp+png` export.
+    png_h: u32,
+}
+
+/// Standard 16:9 widescreen layout: 10 × 5.625 inches (25.4 × 14.288 cm),
+/// rasterised at 4K (3840 × 2160) for sharp display on large monitors.
+const LAYOUT: PresLayout = PresLayout {
+    w_cm: 25.4,
+    h_cm: 14.288,
+    png_w: 3840,
+    png_h: 2160,
+};
 
 /// Export the document (or its slides) as a single ODP file.
 ///
@@ -711,7 +754,7 @@ pub fn export_odp(
         let svg = to_svg_string(lines_for_svg, width, theme);
         let bytes: Vec<u8> = match kind {
             OdpImageKind::Svg => svg.into_bytes(),
-            OdpImageKind::Png => svg_to_png_sized(&svg, theme.bg, PRES_PNG_W, PRES_PNG_H),
+            OdpImageKind::Png => svg_to_png_sized(&svg, theme.bg, LAYOUT.png_w, LAYOUT.png_h),
         };
         slide_images.push(bytes);
     }
@@ -739,11 +782,11 @@ pub fn export_odp(
 
     // styles.xml — page layout + master page (required by PowerPoint's ODP importer)
     zip.start_file("styles.xml", deflated)?;
-    zip.write_all(build_styles_xml(PRES_W_CM, PRES_H_CM).as_bytes())?;
+    zip.write_all(build_styles_xml(LAYOUT.w_cm, LAYOUT.h_cm).as_bytes())?;
 
     // content.xml — one <draw:page> per slide
     zip.start_file("content.xml", deflated)?;
-    zip.write_all(build_content_xml(ext, ranges.len(), PRES_W_CM, PRES_H_CM).as_bytes())?;
+    zip.write_all(build_content_xml(ext, ranges.len(), LAYOUT.w_cm, LAYOUT.h_cm).as_bytes())?;
 
     // Pictures/slideNNNN.{svg|png}
     for (idx, bytes) in slide_images.iter().enumerate() {
