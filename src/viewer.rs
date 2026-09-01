@@ -495,7 +495,7 @@ impl ViewerState {
             .get(self.current_slide + 1)
             .copied()
             .unwrap_or(self.wrapped.len());
-        end - start
+        end.saturating_sub(start)
     }
 
     fn max_slide_offset(&self) -> usize {
@@ -2872,7 +2872,7 @@ fn render_status_bar(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result
         let slide_label = format!(" Slide {}/{} ", state.current_slide + 1, num_slides);
         let slide_len = slide_label.chars().count();
 
-        let hint = " ←/→ navigate · t theme ";
+        let hint = " ←/→ navigate · j/k scroll · t theme ";
         let hint_len = hint.chars().count();
 
         let needed = 4 + lines_len + slide_len + hint_len;
