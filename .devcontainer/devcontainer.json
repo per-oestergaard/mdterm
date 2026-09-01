@@ -6,7 +6,7 @@
 	"image": "mcr.microsoft.com/devcontainers/rust:2-1-trixie",
 	"features": {
 		"ghcr.io/devcontainers/features/powershell:2": {}
-	}
+	},
 
 	// Use 'mounts' to make the cargo cache persistent in a Docker Volume.
 	// "mounts": [
@@ -23,11 +23,40 @@
 	// Use 'forwardPorts' to make a list of ports inside the container available locally.
 	// "forwardPorts": [],
 
-	// Use 'postCreateCommand' to run commands after the container is created.
-	// "postCreateCommand": "rustc --version",
+	// bubblewrap + socat are required by VS Code's agent terminal sandbox on Linux.
+	"postCreateCommand": "sudo apt-get update && sudo apt-get install -y bubblewrap socat",
 
 	// Configure tool-specific properties.
-	// "customizations": {},
+	"customizations": {
+		"vscode": {
+			// These settings only apply while VS Code is attached to this
+			// container — outside it, your normal user/workspace settings apply.
+			"settings": {
+				"chat.tools.terminal.autoApprove": {
+					"cargo": true,
+					"grep": true,
+					"rustc": true,
+					"rustup": true,
+					"/^git (status|diff|log|show\\b.*)$/": true,
+					"rm": false,
+					"/^git (push|reset --hard|clean -f)/": false
+				},
+				// OS-level boundary: this is the real security control, the autoApprove
+				// list above is only there to reduce approval prompts.
+				"chat.agent.sandbox.enabled": "on",
+				"chat.agent.sandbox.allowNetwork": false,
+				"chat.agent.networkFilter": true,
+				"chat.agent.allowedNetworkDomains": [
+					"crates.io",
+					"static.crates.io",
+					"index.crates.io",
+					"github.com",
+					"raw.githubusercontent.com",
+					"docs.rs"
+				]
+			}
+		}
+	}
 
 	// Uncomment to connect as root instead. More info: https://aka.ms/dev-containers-non-root.
 	// "remoteUser": "root"
