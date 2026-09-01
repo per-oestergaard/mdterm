@@ -356,7 +356,7 @@ mod tests {
             assert!(line.display_width() <= 4);
         }
         // All characters preserved
-        let all: String = wrapped.iter().map(|l| line_text(l)).collect();
+        let all: String = wrapped.iter().map(line_text).collect();
         assert_eq!(all, "abcdefghij");
     }
 
@@ -464,7 +464,7 @@ mod tests {
                 line.display_width()
             );
         }
-        let all: String = wrapped.iter().map(|l| line_text(l)).collect();
+        let all: String = wrapped.iter().map(line_text).collect();
         assert_eq!(all, "你好世界测试");
     }
 
@@ -480,7 +480,7 @@ mod tests {
         for line in &wrapped {
             assert!(line.display_width() <= 4);
         }
-        let all: String = wrapped.iter().map(|l| line_text(l)).collect();
+        let all: String = wrapped.iter().map(line_text).collect();
         assert_eq!(all, "🎉🎊🎈");
     }
 
@@ -512,7 +512,7 @@ mod tests {
             "first span should preserve bold style"
         );
         // All text should be preserved across wrapped lines
-        let all_text: String = wrapped.iter().map(|l| line_text(l)).collect();
+        let all_text: String = wrapped.iter().map(line_text).collect();
         assert!(all_text.contains("bold"));
         assert!(all_text.contains("normal"));
         assert!(all_text.contains("text"));
