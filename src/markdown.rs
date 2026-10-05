@@ -8,13 +8,14 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::diagram;
 use crate::style::{
-    BLOCKQUOTE_PREFIX, BLOCKQUOTE_PREFIX_TRIMMED, CodeBlockContent, DocumentInfo, Line, LineMeta,
-    Style, StyledSpan,
+    BLOCKQUOTE_PREFIX, BLOCKQUOTE_PREFIX_TRIMMED, CodeBlockContent, DocumentInfo, FloatImage,
+    FloatSide, Line, LineMeta, Style, StyledSpan,
 };
 use crate::theme::Theme;
 
 struct Renderer<'a> {
     theme: &'a Theme,
+    base_dir: Option<&'a std::path::Path>,
     lines: Vec<Line>,
     current_spans: Vec<StyledSpan>,
     width: usize,
@@ -63,9 +64,11 @@ struct Renderer<'a> {
     in_image: bool,
     image_url: String,
     image_alt: String,
+    pending_float: Option<(u8, FloatSide)>,
 
     // Document info
     code_blocks: Vec<CodeBlockContent>,
+    float_images: Vec<FloatImage>,
 
     // Syntect (shared reference)
     syntax_set: &'a SyntaxSet,
@@ -90,6 +93,7 @@ impl<'a> Renderer<'a> {
     ) -> Self {
         Renderer {
             theme,
+            base_dir: None,
             lines: Vec::new(),
             current_spans: Vec::new(),
             width,
@@ -124,7 +128,9 @@ impl<'a> Renderer<'a> {
             in_image: false,
             image_url: String::new(),
             image_alt: String::new(),
+            pending_float: None,
             code_blocks: Vec::new(),
+            float_images: Vec::new(),
             syntax_set,
             theme_set,
         }
@@ -709,6 +715,9 @@ impl<'a> Renderer<'a> {
 
     fn process(&mut self, event: Event, source_range: std::ops::Range<usize>) {
         match event {
+            Event::Html(html) | Event::InlineHtml(html) => {
+                self.pending_float = parse_float_directive(&html);
+            }
             Event::Start(Tag::Paragraph) => {}
             Event::End(TagEnd::Paragraph) => {
                 self.flush_line();
@@ -942,10 +951,21 @@ impl<'a> Renderer<'a> {
                 } else {
                     std::mem::take(&mut self.image_alt)
                 };
-                let url = std::mem::take(&mut self.image_url);
+                let url = resolve_image_url(&self.image_url, self.base_dir);
+                self.image_url.clear();
 
                 // Flush any pending content
                 self.flush_line();
+
+                if let Some((width_percent, side)) = self.pending_float.take() {
+                    self.float_images.push(FloatImage {
+                        url: url.clone(),
+                        alt: alt.clone(),
+                        width_percent,
+                        side,
+                        line: self.lines.len(),
+                    });
+                }
 
                 let total_rows = crate::image::IMAGE_ROWS;
 
@@ -1093,7 +1113,7 @@ impl<'a> Renderer<'a> {
             }
 
             Event::HardBreak => {
-                self.flush_line();
+                self.flush_line_with_meta(LineMeta::HardBreak);
             }
 
             Event::Rule => {
@@ -1581,6 +1601,26 @@ pub fn render_with(
     slide_mode: bool,
     syntect_res: &SyntectRes,
 ) -> (Vec<Line>, DocumentInfo) {
+    render_with_base_dir(
+        input,
+        width,
+        theme,
+        line_numbers,
+        slide_mode,
+        syntect_res,
+        None,
+    )
+}
+
+pub fn render_with_base_dir(
+    input: &str,
+    width: usize,
+    theme: &Theme,
+    line_numbers: bool,
+    slide_mode: bool,
+    syntect_res: &SyntectRes,
+    base_dir: Option<&std::path::Path>,
+) -> (Vec<Line>, DocumentInfo) {
     let mut renderer = Renderer::new(
         input,
         width,
@@ -1590,6 +1630,7 @@ pub fn render_with(
         &syntect_res.syntax_set,
         &syntect_res.theme_set,
     );
+    renderer.base_dir = base_dir;
 
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
@@ -1605,11 +1646,87 @@ pub fn render_with(
 
     renderer.flush_line();
 
+    let mut float_images = renderer.float_images;
+    for image in &mut float_images {
+        image.line = crate::style::wrap_lines(
+            &renderer.lines[..image.line.min(renderer.lines.len())],
+            width,
+        )
+        .len();
+    }
+
     let doc_info = DocumentInfo {
         code_blocks: renderer.code_blocks,
+        float_images,
     };
 
     (renderer.lines, doc_info)
+}
+
+fn resolve_image_url(url: &str, base_dir: Option<&std::path::Path>) -> String {
+    if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("data:") {
+        return url.to_string();
+    }
+
+    let cwd = match std::env::current_dir().and_then(std::fs::canonicalize) {
+        Ok(path) => path,
+        Err(_) => return url.to_string(),
+    };
+    let base = base_dir.unwrap_or(&cwd);
+    let base = if base.is_absolute() {
+        base.to_path_buf()
+    } else {
+        cwd.join(base)
+    };
+    let candidate = base.join(url);
+    let Ok(path) = std::fs::canonicalize(candidate) else {
+        return url.to_string();
+    };
+    if !path.starts_with(&cwd) {
+        return url.to_string();
+    }
+    path.strip_prefix(&cwd)
+        .ok()
+        .and_then(std::path::Path::to_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| url.to_string())
+}
+
+fn parse_float_directive(html: &str) -> Option<(u8, FloatSide)> {
+    let comment = html
+        .trim()
+        .strip_prefix("<!--")?
+        .strip_suffix("-->")?
+        .trim();
+    let mut parts = comment.split_ascii_whitespace();
+    if parts.next()? != "mdterm:wrap" {
+        return None;
+    }
+
+    let mut width = None;
+    let mut side = None;
+    for part in parts {
+        let (key, value) = part.split_once('=')?;
+        match key {
+            "width" if width.is_none() => {
+                let percent = value.strip_suffix('%')?.parse::<u8>().ok()?;
+                if !(1..=80).contains(&percent) {
+                    return None;
+                }
+                width = Some(percent);
+            }
+            "side" if side.is_none() => {
+                side = Some(match value {
+                    "left" => FloatSide::Left,
+                    "right" => FloatSide::Right,
+                    _ => return None,
+                });
+            }
+            _ => return None,
+        }
+    }
+
+    Some((width?, side?))
 }
 
 #[cfg(test)]
@@ -1742,6 +1859,73 @@ mod tests {
             panic!("expected LineMeta::Image");
         };
         assert_eq!(alt, "image");
+    }
+
+    #[test]
+    fn wrap_comment_attaches_to_next_image() {
+        let input = "<!-- mdterm:wrap width=32% side=right -->\n\n![speaker](speaker.jpg)";
+        let (_, doc_info) = render_test(input);
+
+        assert_eq!(doc_info.float_images.len(), 1);
+        assert_eq!(doc_info.float_images[0].url, "speaker.jpg");
+        assert_eq!(doc_info.float_images[0].alt, "speaker");
+        assert_eq!(doc_info.float_images[0].width_percent, 32);
+        assert_eq!(doc_info.float_images[0].side, FloatSide::Right);
+    }
+
+    #[test]
+    fn wrap_comment_accepts_width_below_ten_percent() {
+        let input = "<!-- mdterm:wrap width=9% side=right -->\n\n![speaker](speaker.jpg)";
+        let (_, doc_info) = render_test(input);
+
+        assert_eq!(doc_info.float_images.len(), 1);
+        assert_eq!(doc_info.float_images[0].width_percent, 9);
+    }
+
+    #[test]
+    fn invalid_wrap_comment_falls_back_to_regular_image() {
+        let input = "<!-- mdterm:wrap width=0% side=right -->\n\n![speaker](speaker.jpg)";
+        let (lines, doc_info) = render_test(input);
+
+        assert!(doc_info.float_images.is_empty());
+        assert!(
+            lines
+                .iter()
+                .any(|line| matches!(line.meta, LineMeta::Image { .. }))
+        );
+    }
+
+    #[test]
+    fn relative_images_resolve_from_document_directory() {
+        let cwd = std::env::current_dir().unwrap();
+        let base_dir = std::path::PathBuf::from("target")
+            .join(format!("mdterm-relative-image-{}", std::process::id()));
+        let absolute_dir = cwd.join(&base_dir);
+        std::fs::create_dir_all(&absolute_dir).unwrap();
+        ::image::RgbaImage::from_pixel(2, 2, ::image::Rgba([1, 2, 3, 255]))
+            .save(absolute_dir.join("picture.png"))
+            .unwrap();
+
+        let input = "![alt](picture.png)";
+        let theme = Theme::dark();
+        let syntect_res = SyntectRes::load();
+        let (lines, _) = render_with_base_dir(
+            input,
+            80,
+            &theme,
+            false,
+            false,
+            &syntect_res,
+            Some(&base_dir),
+        );
+        let url = lines.iter().find_map(|line| match &line.meta {
+            LineMeta::Image { url, .. } => Some(url),
+            _ => None,
+        });
+
+        let expected = base_dir.join("picture.png").to_string_lossy().into_owned();
+        assert_eq!(url.map(String::as_str), Some(expected.as_str()));
+        std::fs::remove_dir_all(absolute_dir).unwrap();
     }
 
     // ── Lists ───────────────────────────────────────────────────────────────

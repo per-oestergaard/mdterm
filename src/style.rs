@@ -42,6 +42,7 @@ pub enum LineMeta {
         /// Byte offset of the `[` in `[ ]`/`[x]` in the source markdown.
         bracket_offset: usize,
     },
+    HardBreak,
     SlideBreak,
     #[allow(dead_code)]
     Image {
@@ -84,6 +85,22 @@ pub struct CodeBlockContent {
 /// Metadata returned alongside rendered lines
 pub struct DocumentInfo {
     pub code_blocks: Vec<CodeBlockContent>,
+    pub float_images: Vec<FloatImage>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FloatSide {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FloatImage {
+    pub url: String,
+    pub alt: String,
+    pub width_percent: u8,
+    pub side: FloatSide,
+    pub line: usize,
 }
 
 pub fn wrap_lines(lines: &[Line], width: usize) -> Vec<Line> {
@@ -187,6 +204,54 @@ pub fn wrap_lines(lines: &[Line], width: usize) -> Vec<Line> {
         }
     }
     result
+}
+
+pub fn coalesce_soft_wrapped_prose(lines: &[Line], start: usize) -> (Line, usize) {
+    let Some(first) = lines.get(start) else {
+        return (Line::empty(), 0);
+    };
+    if !is_reflowable_prose(first) {
+        return (first.clone(), 1);
+    }
+
+    let mut merged = first.clone();
+    let mut consumed = 1;
+    while let Some(next) = lines.get(start + consumed)
+        && is_reflowable_prose(next)
+    {
+        merged.spans.push(StyledSpan {
+            text: " ".to_string(),
+            style: merged
+                .spans
+                .last()
+                .map(|span| span.style.clone())
+                .unwrap_or_default(),
+        });
+        merged.spans.extend(next.spans.clone());
+        consumed += 1;
+    }
+    (merged, consumed)
+}
+
+fn is_reflowable_prose(line: &Line) -> bool {
+    if !matches!(line.meta, LineMeta::None) || line.spans.is_empty() {
+        return false;
+    }
+
+    let text: String = line.spans.iter().map(|span| span.text.as_str()).collect();
+    if text.starts_with(BLOCKQUOTE_PREFIX)
+        || line.spans.iter().any(|span| span.style.bg.is_some())
+        || text.chars().any(|ch| {
+            matches!(
+                ch,
+                '─' | '│' | '╭' | '╮' | '╰' | '╯' | '├' | '┤' | '┬' | '┴' | '┼'
+            )
+        })
+    {
+        return false;
+    }
+
+    true
 }
 
 fn word_wrap(line: &Line, width: usize) -> Vec<Line> {

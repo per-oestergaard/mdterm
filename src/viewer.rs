@@ -19,7 +19,9 @@ use crossterm::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::markdown::SyntectRes;
-use crate::style::{DocumentInfo, Line, LineMeta, StyledSpan, wrap_lines};
+use crate::style::{
+    DocumentInfo, Line, LineMeta, StyledSpan, coalesce_soft_wrapped_prose, wrap_lines,
+};
 use crate::theme::Theme;
 
 // ── Public API ──────────────────────────────────────────────────────────────
@@ -290,7 +292,9 @@ struct ViewerState {
     // Display
     theme: Theme,
     wrapped: Vec<Line>,
+    source_wrapped: Vec<Line>,
     doc_info: DocumentInfo,
+    float_placements: Vec<FloatPlacement>,
     offset: usize,
     cols: u16,
     rows: u16,
@@ -384,6 +388,15 @@ struct TocEntry {
 }
 
 #[derive(Clone)]
+struct FloatPlacement {
+    url: String,
+    top_line: usize,
+    rows: usize,
+    cols: usize,
+    side: crate::style::FloatSide,
+}
+
+#[derive(Clone)]
 #[allow(dead_code)]
 struct LinkEntry {
     url: String,
@@ -411,9 +424,12 @@ impl ViewerState {
             filename: opts.filename,
             theme: opts.theme,
             wrapped: Vec::new(),
+            source_wrapped: Vec::new(),
             doc_info: DocumentInfo {
                 code_blocks: Vec::new(),
+                float_images: Vec::new(),
             },
+            float_placements: Vec::new(),
             offset: 0,
             cols,
             rows,
@@ -557,24 +573,26 @@ impl ViewerState {
                 }
             } else {
                 self.json_view = None;
-                crate::markdown::render_with(
+                crate::markdown::render_with_base_dir(
                     &self.content,
                     cw,
                     &self.theme,
                     self.line_numbers,
                     self.slide_mode,
                     &self.syntect_res,
+                    std::path::Path::new(&self.filename).parent(),
                 )
             }
         } else {
             self.json_view = None;
-            crate::markdown::render_with(
+            crate::markdown::render_with_base_dir(
                 &self.content,
                 cw,
                 &self.theme,
                 self.line_numbers,
                 self.slide_mode,
                 &self.syntect_res,
+                std::path::Path::new(&self.filename).parent(),
             )
         };
         // Pre-compute list content from pre-wrap lines so that word-wrapping
@@ -595,7 +613,8 @@ impl ViewerState {
                 entry.push_str(&text);
             }
         }
-        self.wrapped = wrap_lines(&lines, cw);
+        self.source_wrapped = wrap_lines(&lines, cw);
+        self.wrapped = self.source_wrapped.clone();
         self.doc_info = doc_info;
 
         // Queue any not-yet-fetched images; actual fetching happens in the
@@ -627,6 +646,7 @@ impl ViewerState {
     /// and whenever new image fetches complete (without re-parsing markdown).
     fn finalize_layout(&mut self) {
         let cw = self.content_width();
+        self.wrapped.clone_from(&self.source_wrapped);
 
         // Adjust image placeholder rows to match actual image aspect ratio.
         // Track how many rows shift above the current scroll offset so we
@@ -634,8 +654,116 @@ impl ViewerState {
         let old_offset = self.offset;
         let mut offset_delta: isize = 0;
         let mut new_wrapped = Vec::with_capacity(self.wrapped.len());
+        self.float_placements.clear();
+        let float_images = self.doc_info.float_images.clone();
+        let mut active_float: Option<(usize, usize, usize, crate::style::FloatSide)> = None;
+        let mut has_float_on_slide = false;
+        let mut float_reserve_end = 0;
         let mut i = 0;
         while i < self.wrapped.len() {
+            if !has_float_on_slide
+                && let Some(float) = float_images.iter().find(|float| float.line == i)
+                && let LineMeta::Image {
+                    url,
+                    row: 0,
+                    total_rows,
+                    ..
+                } = &self.wrapped[i].meta
+                && url == &float.url
+            {
+                let url = url.clone();
+                let total_rows = *total_rows;
+                let max_cols =
+                    (cw * float.width_percent as usize / 100).clamp(1, cw.saturating_sub(2).max(1));
+                if let Some((cols, rows)) = self.image_cache.float_display_size(&url, max_cols) {
+                    let top_line = new_wrapped.len();
+                    self.float_placements.push(FloatPlacement {
+                        url,
+                        top_line,
+                        rows,
+                        cols,
+                        side: float.side,
+                    });
+                    active_float = Some((top_line, rows, cols, float.side));
+                    has_float_on_slide = true;
+                    float_reserve_end = top_line + rows;
+                    i += total_rows;
+
+                    if self.wrapped.get(i).is_some_and(|line| {
+                        line.spans
+                            .iter()
+                            .map(|span| span.text.as_str())
+                            .collect::<String>()
+                            == format!("  {}", float.alt)
+                    }) {
+                        i += 1;
+                    }
+                    while self
+                        .wrapped
+                        .get(i)
+                        .is_some_and(|line| line.spans.is_empty())
+                    {
+                        i += 1;
+                    }
+                    continue;
+                }
+            }
+
+            if matches!(self.wrapped[i].meta, LineMeta::SlideBreak) {
+                while new_wrapped.len() < float_reserve_end {
+                    new_wrapped.push(Line::empty());
+                }
+                float_reserve_end = 0;
+                active_float = None;
+                has_float_on_slide = false;
+            }
+
+            if let Some((top, rows, cols, side)) = active_float
+                && new_wrapped.len() < top + rows
+                && !matches!(
+                    self.wrapped[i].meta,
+                    LineMeta::Image { .. } | LineMeta::SlideBreak
+                )
+            {
+                let text_width = cw.saturating_sub(cols + 1).max(1);
+                let (source_line, consumed) = coalesce_soft_wrapped_prose(&self.wrapped, i);
+                let reflowed = wrap_lines(std::slice::from_ref(&source_line), text_width);
+                let remaining_rows = (top + rows).saturating_sub(new_wrapped.len());
+                let float_rows = reflowed.len().min(remaining_rows);
+                for mut line in reflowed.iter().take(float_rows).cloned() {
+                    if side == crate::style::FloatSide::Left {
+                        line.spans.insert(
+                            0,
+                            crate::style::StyledSpan {
+                                text: " ".repeat(cols + 1),
+                                style: Default::default(),
+                            },
+                        );
+                    }
+                    new_wrapped.push(line);
+                }
+
+                if reflowed.len() > remaining_rows {
+                    let mut remainder = Line {
+                        spans: Vec::new(),
+                        meta: source_line.meta.clone(),
+                    };
+                    for (index, line) in reflowed.iter().skip(remaining_rows).enumerate() {
+                        if index > 0 {
+                            remainder.spans.push(crate::style::StyledSpan {
+                                text: " ".to_string(),
+                                style: Default::default(),
+                            });
+                        }
+                        remainder.spans.extend(line.spans.clone());
+                    }
+                    new_wrapped.extend(wrap_lines(&[remainder], cw));
+                    active_float = None;
+                }
+                i += consumed;
+                continue;
+            }
+
             if let LineMeta::Image {
                 ref url,
                 row: 0,
@@ -675,6 +803,9 @@ impl ViewerState {
                 new_wrapped.push(self.wrapped[i].clone());
                 i += 1;
             }
+        }
+        while new_wrapped.len() < float_reserve_end {
+            new_wrapped.push(Line::empty());
         }
         self.wrapped = new_wrapped;
         self.offset = (old_offset as isize + offset_delta).max(0) as usize;
@@ -2821,6 +2952,36 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
         }
     }
 
+    if !suppress_images {
+        for float in state.float_placements.clone() {
+            let visible_start = float.top_line.max(slide_start);
+            let visible_end = (float.top_line + float.rows)
+                .min(slide_end)
+                .min(slide_start + viewport);
+            for line_idx in visible_start..visible_end {
+                let screen_row = line_idx - slide_start;
+                let image_row = line_idx - float.top_line;
+                let x_offset = match float.side {
+                    crate::style::FloatSide::Left => 0,
+                    crate::style::FloatSide::Right => content_width.saturating_sub(float.cols),
+                };
+                queue!(
+                    stdout,
+                    MoveTo(
+                        (ViewerState::GUTTER_COLS + x_offset) as u16,
+                        (screen_row + 1) as u16
+                    )
+                )?;
+                let rendered = state.image_cache.render_float_row(
+                    stdout, &float.url, image_row, float.cols, 0, float.cols, theme.bg,
+                )?;
+                if !rendered {
+                    break;
+                }
+            }
+        }
+    }
+
     // Status bar
     render_status_bar(stdout, state)?;
 
@@ -4064,6 +4225,85 @@ fn write_span(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn marked_image_reflows_text_until_float_bottom() {
+        let relative_path = format!("target/mdterm-viewer-float-{}.png", std::process::id());
+        let absolute_path = std::env::current_dir().unwrap().join(&relative_path);
+        std::fs::create_dir_all(absolute_path.parent().unwrap()).unwrap();
+        let source_image = image::RgbaImage::from_pixel(24, 16, image::Rgba([30, 90, 180, 255]));
+        source_image.save(&absolute_path).unwrap();
+
+        let text = (0..80).map(|_| "flow").collect::<Vec<_>>().join(" ");
+        let content = format!(
+            "<!-- mdterm:wrap width=32% side=left -->\n\n![scene]({relative_path})\n\n{text}"
+        );
+        let opts = ViewerOptions {
+            files: Vec::new(),
+            initial_content: content,
+            filename: "<stdin>".to_string(),
+            theme: Theme::dark(),
+            slide_mode: false,
+            line_numbers: false,
+            width_override: None,
+        };
+        let mut state = ViewerState::new(opts, 44, 30);
+        state.rebuild();
+        state.image_cache.insert(
+            &relative_path,
+            Some(image::DynamicImage::ImageRgba8(source_image)),
+        );
+        state.finalize_layout();
+
+        assert_eq!(state.float_placements.len(), 1);
+        assert!(
+            !state
+                .wrapped
+                .iter()
+                .any(|line| matches!(line.meta, LineMeta::Image { .. }))
+        );
+        let placement = &state.float_placements[0];
+        let indented_text = state.wrapped[placement.top_line..placement.top_line + placement.rows]
+            .iter()
+            .filter(|line| !line.spans.is_empty())
+            .any(|line| line.spans[0].text.starts_with(" "));
+        assert!(
+            indented_text,
+            "text should occupy the column beside the float"
+        );
+        assert!(
+            state.wrapped[placement.top_line + placement.rows..]
+                .iter()
+                .any(|line| !line.spans.is_empty() && !line.spans[0].text.starts_with(" "))
+        );
+
+        drop(state);
+
+        let short_content = format!(
+            "<!-- mdterm:wrap width=32% side=left -->\n\n![scene]({relative_path})\n\nshort text\n\n---\n\nnext slide"
+        );
+        let short_opts = ViewerOptions {
+            files: Vec::new(),
+            initial_content: short_content,
+            filename: "<stdin>".to_string(),
+            theme: Theme::dark(),
+            slide_mode: true,
+            line_numbers: false,
+            width_override: None,
+        };
+        let mut short_state = ViewerState::new(short_opts, 44, 30);
+        short_state.rebuild();
+        short_state
+            .image_cache
+            .insert(&relative_path, Some(image::open(&absolute_path).unwrap()));
+        short_state.finalize_layout();
+        let placement = &short_state.float_placements[0];
+        let first_slide_end = short_state.slide_boundaries[1];
+        assert!(placement.top_line + placement.rows <= first_slide_end);
+
+        drop(short_state);
+        std::fs::remove_file(absolute_path).unwrap();
+    }
 
     #[test]
     fn help_sections_non_empty() {

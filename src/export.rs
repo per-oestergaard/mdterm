@@ -4,7 +4,9 @@ use crossterm::style::Color;
 use unicode_width::UnicodeWidthStr;
 
 use crate::markdown;
-use crate::style::{LineMeta, wrap_lines};
+use crate::style::{
+    FloatImage, FloatSide, Line, LineMeta, StyledSpan, coalesce_soft_wrapped_prose, wrap_lines,
+};
 use crate::theme::Theme;
 
 pub fn to_html(content: &str, width: usize, theme: &Theme, filename: &str) {
@@ -249,6 +251,25 @@ impl SvgMetrics {
 /// Each `StyledSpan` becomes a `<tspan>` with the correct colours and
 /// font attributes; background colours get a `<rect>` drawn behind the text.
 pub fn to_svg_string(lines: &[crate::style::Line], width: usize, theme: &Theme) -> String {
+    to_svg_string_with_floats(lines, width, theme, &[])
+}
+
+#[derive(Clone)]
+struct FloatPlacement {
+    data_uri: String,
+    x: f64,
+    y: f64,
+    top_row: usize,
+    width: f64,
+    height: f64,
+}
+
+fn to_svg_string_with_floats(
+    lines: &[Line],
+    width: usize,
+    theme: &Theme,
+    floats: &[FloatPlacement],
+) -> String {
     use std::fmt::Write as FmtWrite;
 
     let m = &METRICS;
@@ -264,8 +285,13 @@ pub fn to_svg_string(lines: &[crate::style::Line], width: usize, theme: &Theme) 
         h = svg_h as u32,
     );
     // Background fills the whole canvas so dark/light themes both look correct.
-    let _ = write!(svg, r#"<rect width="{w}" height="{h}" fill="{bg}"/>"#,
-        w = svg_w as u32, h = svg_h as u32, bg = color_css(theme.bg));
+    let _ = write!(
+        svg,
+        r#"<rect width="{w}" height="{h}" fill="{bg}"/>"#,
+        w = svg_w as u32,
+        h = svg_h as u32,
+        bg = color_css(theme.bg)
+    );
     // Embedded font definition — DejaVu Sans Mono is the fallback for systems
     // without Courier New.
     let _ = write!(
@@ -279,10 +305,10 @@ pub fn to_svg_string(lines: &[crate::style::Line], width: usize, theme: &Theme) 
         .iter()
         .enumerate()
         .map(|(row, line)| {
-            let y_top      = m.pad + row as f64 * m.line_height;
+            let y_top = m.pad + row as f64 * m.line_height;
             let y_baseline = y_top + m.line_height * m.baseline_ratio;
-            let bgs        = svg_bg_rects(line, y_top, m);
-            let content    = if line.spans.is_empty() {
+            let bgs = svg_bg_rects(line, y_top, m);
+            let content = if line.spans.is_empty() {
                 String::new()
             } else if is_box_drawing_line(line) {
                 svg_box_line(line, y_top, m, theme)
@@ -294,8 +320,206 @@ pub fn to_svg_string(lines: &[crate::style::Line], width: usize, theme: &Theme) 
         .collect();
 
     svg.push_str(&body);
+    for float in floats {
+        let _ = write!(
+            svg,
+            r#"<image href="{}" x="{}" y="{}" width="{}" height="{}" preserveAspectRatio="xMidYMid meet"/>"#,
+            float.data_uri,
+            float.x as u32,
+            float.y as u32,
+            float.width.ceil() as u32,
+            float.height.ceil() as u32,
+        );
+    }
     let _ = write!(svg, "</svg>");
     svg
+}
+
+fn load_float_image(
+    url: &str,
+    total_width: usize,
+    width_cols: usize,
+    side: FloatSide,
+    top_row: usize,
+) -> Option<(FloatDimensions, FloatPlacement)> {
+    use base64::Engine as _;
+    use image::GenericImageView;
+    use std::io::Cursor;
+
+    let root = std::env::current_dir().ok()?.canonicalize().ok()?;
+    let path = std::fs::canonicalize(url).ok()?;
+    if !path.starts_with(&root) {
+        return None;
+    }
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    if !matches!(extension.as_str(), "png" | "jpg" | "jpeg") {
+        return None;
+    }
+    let image = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .decode()
+        .ok()?;
+    let (source_width, source_height) = image.dimensions();
+    if source_width == 0 || source_height == 0 {
+        return None;
+    }
+    let width = width_cols as f64 * METRICS.char_width;
+    let height = width * source_height as f64 / source_width as f64;
+    let x = match side {
+        FloatSide::Left => METRICS.pad,
+        FloatSide::Right => {
+            METRICS.pad + (total_width.saturating_sub(width_cols) as f64) * METRICS.char_width
+        }
+    };
+    let mut png = Cursor::new(Vec::new());
+    image.write_to(&mut png, image::ImageFormat::Png).ok()?;
+    let data_uri = format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(png.into_inner())
+    );
+    let placement = FloatPlacement {
+        data_uri,
+        x,
+        y: METRICS.pad + top_row as f64 * METRICS.line_height,
+        top_row,
+        width,
+        height,
+    };
+    Some((
+        FloatDimensions {
+            height_rows: (height / METRICS.line_height).ceil().max(1.0) as usize,
+        },
+        placement,
+    ))
+}
+
+struct FloatDimensions {
+    height_rows: usize,
+}
+
+fn layout_float_lines(
+    lines: &[Line],
+    width: usize,
+    float_images: &[FloatImage],
+) -> (Vec<Line>, Vec<FloatPlacement>) {
+    let mut output = Vec::new();
+    let mut placements = Vec::new();
+    let mut active_float: Option<(usize, usize, usize, FloatSide)> = None;
+    let mut max_image_end = 0;
+    let mut has_float_on_slide = false;
+    let mut line_index = 0;
+
+    while line_index < lines.len() {
+        if !has_float_on_slide
+            && let Some(float_image) = float_images.iter().find(|float| float.line == line_index)
+            && matches!(lines.get(line_index).map(|line| &line.meta), Some(LineMeta::Image { url, row: 0, .. }) if url == &float_image.url)
+        {
+            let image_cols = (width * float_image.width_percent as usize / 100)
+                .clamp(1, width.saturating_sub(2).max(1));
+            let top_row = output.len();
+            if let Some((dimensions, placement)) = load_float_image(
+                &float_image.url,
+                width,
+                image_cols,
+                float_image.side,
+                top_row,
+            ) {
+                let mut placement = placement;
+                placement.y = METRICS.pad + top_row as f64 * METRICS.line_height;
+                active_float = Some((
+                    top_row,
+                    dimensions.height_rows,
+                    image_cols,
+                    float_image.side,
+                ));
+                has_float_on_slide = true;
+                max_image_end = max_image_end.max(top_row + dimensions.height_rows);
+                placements.push(placement);
+                if let LineMeta::Image { total_rows, .. } = lines[line_index].meta {
+                    line_index += total_rows;
+                }
+                if lines.get(line_index).is_some_and(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.text.as_str())
+                        .collect::<String>()
+                        == format!("  {}", float_image.alt)
+                }) {
+                    line_index += 1;
+                }
+                continue;
+            }
+        }
+
+        let line = &lines[line_index];
+        if matches!(line.meta, LineMeta::SlideBreak) {
+            active_float = None;
+            max_image_end = max_image_end.min(output.len());
+            has_float_on_slide = false;
+        }
+        if let Some((top, height, image_cols, side)) = active_float
+            && output.len() < top + height
+            && !matches!(line.meta, LineMeta::SlideBreak)
+        {
+            let text_width = width.saturating_sub(image_cols + 1).max(1);
+            let (source_line, consumed) = coalesce_soft_wrapped_prose(lines, line_index);
+            let mut reflowed = wrap_lines(std::slice::from_ref(&source_line), text_width);
+            let float_rows_left = (top + height).saturating_sub(output.len());
+            if reflowed.len() > float_rows_left {
+                for wrapped in reflowed.iter_mut().take(float_rows_left) {
+                    if side == FloatSide::Left {
+                        wrapped.spans.insert(
+                            0,
+                            StyledSpan {
+                                text: " ".repeat(image_cols + 1),
+                                style: Default::default(),
+                            },
+                        );
+                    }
+                }
+                output.extend(reflowed.iter().take(float_rows_left).cloned());
+
+                let mut remainder = Line {
+                    spans: Vec::new(),
+                    meta: source_line.meta.clone(),
+                };
+                for (index, wrapped) in reflowed.iter().skip(float_rows_left).enumerate() {
+                    if index > 0 {
+                        remainder.spans.push(StyledSpan {
+                            text: " ".to_string(),
+                            style: Default::default(),
+                        });
+                    }
+                    remainder.spans.extend(wrapped.spans.clone());
+                }
+                output.extend(wrap_lines(&[remainder], width));
+                active_float = None;
+            } else {
+                if side == FloatSide::Left {
+                    for wrapped in &mut reflowed {
+                        wrapped.spans.insert(
+                            0,
+                            StyledSpan {
+                                text: " ".repeat(image_cols + 1),
+                                style: Default::default(),
+                            },
+                        );
+                    }
+                }
+                output.extend(reflowed);
+            }
+            line_index += consumed;
+            continue;
+        } else {
+            output.push(line.clone());
+        }
+        line_index += 1;
+    }
+
+    output.extend((output.len()..max_image_end).map(|_| Line::empty()));
+    (output, placements)
 }
 
 /// Append a single `<rect>` element to an SVG string.
@@ -360,12 +584,12 @@ fn box_char_dirs(c: char) -> BoxDirs {
 fn svg_escape(s: &str) -> String {
     s.chars()
         .map(|c| match c {
-            '&'  => "&amp;".to_string(),
-            '<'  => "&lt;".to_string(),
-            '>'  => "&gt;".to_string(),
-            '"'  => "&quot;".to_string(),
+            '&' => "&amp;".to_string(),
+            '<' => "&lt;".to_string(),
+            '>' => "&gt;".to_string(),
+            '"' => "&quot;".to_string(),
             '\'' => "&#39;".to_string(),
-            c    => c.to_string(),
+            c => c.to_string(),
         })
         .collect()
 }
@@ -390,21 +614,37 @@ fn svg_bg_rects(line: &crate::style::Line, y_top: f64, m: &SvgMetrics) -> String
 /// Build the SVG attribute string for one `<tspan>`.
 fn svg_tspan_attrs(span: &crate::style::StyledSpan, x_pos: f64, theme: &Theme) -> String {
     let fg = color_css(span.style.fg.unwrap_or(theme.fg));
-    let weight    = span.style.bold   .then_some(r#" font-weight="bold""#).unwrap_or("");
-    let italic    = span.style.italic .then_some(r#" font-style="italic""#).unwrap_or("");
-    let dim       = span.style.dim    .then_some(r#" opacity="0.5""#).unwrap_or("");
+    let weight = span
+        .style
+        .bold
+        .then_some(r#" font-weight="bold""#)
+        .unwrap_or("");
+    let italic = span
+        .style
+        .italic
+        .then_some(r#" font-style="italic""#)
+        .unwrap_or("");
+    let dim = span.style.dim.then_some(r#" opacity="0.5""#).unwrap_or("");
     let decoration = match (span.style.underline, span.style.strikethrough) {
-        (true,  true)  => r#" text-decoration="underline line-through""#,
-        (true,  false) => r#" text-decoration="underline""#,
-        (false, true)  => r#" text-decoration="line-through""#,
+        (true, true) => r#" text-decoration="underline line-through""#,
+        (true, false) => r#" text-decoration="underline""#,
+        (false, true) => r#" text-decoration="line-through""#,
         (false, false) => "",
     };
-    format!(r#" x="{x}" fill="{fg}"{weight}{italic}{decoration}{dim}"#, x = x_pos as u32)
+    format!(
+        r#" x="{x}" fill="{fg}"{weight}{italic}{decoration}{dim}"#,
+        x = x_pos as u32
+    )
 }
 
 /// Render a line of styled text as `<text>…</text>` with one `<tspan>` per span.
 /// `scan` carries the x-position forward through the span iterator.
-fn svg_text_line(line: &crate::style::Line, y_baseline: f64, m: &SvgMetrics, theme: &Theme) -> String {
+fn svg_text_line(
+    line: &crate::style::Line,
+    y_baseline: f64,
+    m: &SvgMetrics,
+    theme: &Theme,
+) -> String {
     let tspans: String = line
         .spans
         .iter()
@@ -412,7 +652,11 @@ fn svg_text_line(line: &crate::style::Line, y_baseline: f64, m: &SvgMetrics, the
             let span_w = UnicodeWidthStr::width(span.text.as_str()) as f64 * m.char_width;
             let attrs = svg_tspan_attrs(span, *x_pos, theme);
             *x_pos += span_w;
-            Some(format!("<tspan{}>{}</tspan>", attrs, svg_escape(&span.text)))
+            Some(format!(
+                "<tspan{}>{}</tspan>",
+                attrs,
+                svg_escape(&span.text)
+            ))
         })
         .collect();
     format!(
@@ -424,22 +668,52 @@ fn svg_text_line(line: &crate::style::Line, y_baseline: f64, m: &SvgMetrics, the
 /// Render a box-drawing line as a series of pixel-perfect `<rect>` elements.
 /// Uses `flat_map` + `scan` so there are no mutable variables outside iterators.
 fn svg_box_line(line: &crate::style::Line, y_top: f64, m: &SvgMetrics, theme: &Theme) -> String {
-    let bar_t  = (m.line_height * m.box_bar_ratio).max(2.0);
-    let mid_y  = y_top + m.half_line_height();
+    let bar_t = (m.line_height * m.box_bar_ratio).max(2.0);
+    let mid_y = y_top + m.half_line_height();
     let half_bar = bar_t * 0.5;
-    let fill = color_css(line.spans.iter().find_map(|s| s.style.fg).unwrap_or(theme.fg));
+    let fill = color_css(
+        line.spans
+            .iter()
+            .find_map(|s| s.style.fg)
+            .unwrap_or(theme.fg),
+    );
 
     line.spans
         .iter()
         .flat_map(|s| s.text.chars().collect::<Vec<_>>())
         .scan(m.pad, |cx, ch| {
-            let dirs       = box_char_dirs(ch);
+            let dirs = box_char_dirs(ch);
             let char_mid_x = *cx + m.half_char_width();
             let rects: Vec<String> = [
-                dirs.left .then(|| svg_rect(*cx,                    mid_y - half_bar, m.half_char_width(), bar_t,             &fill)),
-                dirs.right.then(|| svg_rect(*cx + m.half_char_width(), mid_y - half_bar, m.half_char_width(), bar_t,          &fill)),
-                dirs.up   .then(|| svg_rect(char_mid_x - half_bar, y_top,             bar_t,             m.half_line_height(), &fill)),
-                dirs.down .then(|| svg_rect(char_mid_x - half_bar, y_top + m.half_line_height(), bar_t, m.half_line_height(), &fill)),
+                dirs.left
+                    .then(|| svg_rect(*cx, mid_y - half_bar, m.half_char_width(), bar_t, &fill)),
+                dirs.right.then(|| {
+                    svg_rect(
+                        *cx + m.half_char_width(),
+                        mid_y - half_bar,
+                        m.half_char_width(),
+                        bar_t,
+                        &fill,
+                    )
+                }),
+                dirs.up.then(|| {
+                    svg_rect(
+                        char_mid_x - half_bar,
+                        y_top,
+                        bar_t,
+                        m.half_line_height(),
+                        &fill,
+                    )
+                }),
+                dirs.down.then(|| {
+                    svg_rect(
+                        char_mid_x - half_bar,
+                        y_top + m.half_line_height(),
+                        bar_t,
+                        m.half_line_height(),
+                        &fill,
+                    )
+                }),
             ]
             .into_iter()
             .flatten()
@@ -471,6 +745,19 @@ fn slide_ranges(wrapped: &[crate::style::Line]) -> Vec<(usize, usize)> {
         .collect()
 }
 
+fn floats_for_slide(floats: &[FloatPlacement], start: usize, end: usize) -> Vec<FloatPlacement> {
+    floats
+        .iter()
+        .filter(|float| float.top_row >= start && float.top_row < end)
+        .cloned()
+        .map(|mut float| {
+            float.top_row -= start;
+            float.y = METRICS.pad + float.top_row as f64 * METRICS.line_height;
+            float
+        })
+        .collect()
+}
+
 /// Export the document (or its slides) as a series of SVG files.
 /// With `slide_mode = true`, one file per slide; otherwise a single file.
 /// Files are written as `{prefix}0001.svg`, `{prefix}0002.svg`, …
@@ -480,12 +767,23 @@ pub fn export_slides_svg(
     theme: &Theme,
     prefix: &str,
     slide_mode: bool,
+    base_dir: Option<&std::path::Path>,
 ) {
     use std::fs;
     use std::path::Path;
 
-    let (lines, _) = markdown::render(content, width, theme, false);
+    let syntect_res = markdown::SyntectRes::load();
+    let (lines, doc_info) = markdown::render_with_base_dir(
+        content,
+        width,
+        theme,
+        false,
+        slide_mode,
+        &syntect_res,
+        base_dir,
+    );
     let wrapped = crate::style::wrap_lines(&lines, width);
+    let (wrapped, floats) = layout_float_lines(&wrapped, width, &doc_info.float_images);
 
     let ranges = if slide_mode {
         slide_ranges(&wrapped)
@@ -505,7 +803,12 @@ pub fn export_slides_svg(
 
     for (idx, (start, end)) in ranges.iter().enumerate() {
         let slide_lines = &wrapped[*start..*end];
-        let svg = to_svg_string(slide_lines, width, theme);
+        let slide_floats = floats_for_slide(&floats, *start, *end);
+        let svg = if slide_floats.is_empty() {
+            to_svg_string(slide_lines, width, theme)
+        } else {
+            to_svg_string_with_floats(slide_lines, width, theme, &slide_floats)
+        };
         let path = format!("{}{:04}.svg", prefix, idx + 1);
         if let Err(e) = fs::write(&path, &svg) {
             eprintln!("Error writing '{}': {}", path, e);
@@ -620,12 +923,23 @@ pub fn export_slides_png(
     theme: &Theme,
     prefix: &str,
     slide_mode: bool,
+    base_dir: Option<&std::path::Path>,
 ) {
     use std::fs;
     use std::path::Path;
 
-    let (lines, _) = markdown::render(content, width, theme, false);
+    let syntect_res = markdown::SyntectRes::load();
+    let (lines, doc_info) = markdown::render_with_base_dir(
+        content,
+        width,
+        theme,
+        false,
+        slide_mode,
+        &syntect_res,
+        base_dir,
+    );
     let wrapped = crate::style::wrap_lines(&lines, width);
+    let (wrapped, floats) = layout_float_lines(&wrapped, width, &doc_info.float_images);
 
     let ranges = if slide_mode {
         slide_ranges(&wrapped)
@@ -645,7 +959,12 @@ pub fn export_slides_png(
 
     for (idx, (start, end)) in ranges.iter().enumerate() {
         let slide_lines = &wrapped[*start..*end];
-        let svg = to_svg_string(slide_lines, width, theme);
+        let slide_floats = floats_for_slide(&floats, *start, *end);
+        let svg = if slide_floats.is_empty() {
+            to_svg_string(slide_lines, width, theme)
+        } else {
+            to_svg_string_with_floats(slide_lines, width, theme, &slide_floats)
+        };
         let png = svg_to_png(&svg, theme.bg);
         let path = format!("{}{:04}.png", prefix, idx + 1);
         if let Err(e) = fs::write(&path, &png) {
@@ -703,6 +1022,7 @@ pub fn export_odp(
     out_path: &str,
     slide_mode: bool,
     kind: OdpImageKind,
+    base_dir: Option<&std::path::Path>,
 ) -> std::io::Result<()> {
     use std::fs::File;
     use std::io::{BufWriter, Write};
@@ -710,8 +1030,18 @@ pub fn export_odp(
     use zip::write::SimpleFileOptions;
 
     // ── 1. Render markdown → slides ──────────────────────────────────────
-    let (lines, _) = markdown::render(content, width, theme, false);
+    let syntect_res = markdown::SyntectRes::load();
+    let (lines, doc_info) = markdown::render_with_base_dir(
+        content,
+        width,
+        theme,
+        false,
+        slide_mode,
+        &syntect_res,
+        base_dir,
+    );
     let wrapped = crate::style::wrap_lines(&lines, width);
+    let (wrapped, floats) = layout_float_lines(&wrapped, width, &doc_info.float_images);
     let ranges = if slide_mode {
         slide_ranges(&wrapped)
     } else {
@@ -751,7 +1081,12 @@ pub fn export_odp(
             slide_lines
         };
 
-        let svg = to_svg_string(lines_for_svg, width, theme);
+        let slide_floats = floats_for_slide(&floats, *start, *end);
+        let svg = if slide_floats.is_empty() {
+            to_svg_string(lines_for_svg, width, theme)
+        } else {
+            to_svg_string_with_floats(lines_for_svg, width, theme, &slide_floats)
+        };
         let bytes: Vec<u8> = match kind {
             OdpImageKind::Svg => svg.into_bytes(),
             OdpImageKind::Png => svg_to_png_sized(&svg, theme.bg, LAYOUT.png_w, LAYOUT.png_h),
@@ -993,6 +1328,74 @@ mod tests {
         // Empty/whitespace-only: no colon before slash → treated as relative
         assert!(is_safe_url(""));
         assert!(is_safe_url("   "));
+    }
+
+    #[test]
+    fn float_reflows_text_and_embeds_image() {
+        let image_path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("mdterm-float-{}.png", std::process::id()));
+        image::RgbaImage::from_pixel(24, 12, image::Rgba([220, 30, 40, 255]))
+            .save(&image_path)
+            .unwrap();
+        let relative_path = image_path
+            .strip_prefix(std::env::current_dir().unwrap())
+            .unwrap()
+            .to_string_lossy();
+        let input = format!(
+            "<!-- mdterm:wrap width=32% side=left -->\n\n![scene]({relative_path})\n\n{}\n\n---\n\nnext slide",
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega"
+        );
+        let (lines, doc_info) = markdown::render(&input, 40, &Theme::dark(), false);
+        let wrapped = wrap_lines(&lines, 40);
+        let (laid_out, placements) = layout_float_lines(&wrapped, 40, &doc_info.float_images);
+
+        assert_eq!(placements.len(), 1);
+        assert!(placements[0].x < METRICS.pad + 1.0);
+        assert!(
+            !laid_out
+                .iter()
+                .any(|line| matches!(line.meta, LineMeta::Image { .. }))
+        );
+        let text_rows: Vec<String> = laid_out
+            .iter()
+            .filter(|line| !line.spans.is_empty())
+            .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
+            .collect();
+        assert!(text_rows[0].starts_with("             "));
+        assert!(
+            text_rows[1].starts_with("             alpha"),
+            "{text_rows:?}"
+        );
+        assert!(
+            text_rows[2].starts_with("             epsilon"),
+            "{text_rows:?}"
+        );
+        assert!(text_rows[3].starts_with("kappa"), "{text_rows:?}");
+        let float_end = placements[0].top_row + 3;
+        for line in &laid_out[placements[0].top_row..float_end] {
+            if line.display_width() > 13 {
+                assert!(line.display_width() - 13 <= 27, "{line:?}");
+            }
+        }
+
+        let ranges = slide_ranges(&laid_out);
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(
+            floats_for_slide(&placements, ranges[0].0, ranges[0].1).len(),
+            1
+        );
+        assert_eq!(
+            floats_for_slide(&placements, ranges[1].0, ranges[1].1).len(),
+            0
+        );
+
+        let svg = to_svg_string_with_floats(&laid_out, 40, &Theme::dark(), &placements);
+        assert!(svg.contains("<image href=\"data:image/png;base64,"));
+        let png = svg_to_png(&svg, Theme::dark().bg);
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        std::fs::remove_file(image_path).unwrap();
     }
 
     // ── is_safe_img_src ─────────────────────────────────────────────────

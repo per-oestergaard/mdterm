@@ -779,13 +779,76 @@ struct SixelImage {
     crop_cache: Option<(usize, usize, String)>,
 }
 
-/// Pre-rendered half-block image: uses Unicode ▀ with fg/bg colors to render
-/// two vertical pixels per terminal cell. Works in any terminal.
+/// Pre-rendered float image: two-by-two pixels are mapped to a quadrant glyph.
 struct HalfBlockImage {
     cols: usize,
     rows: usize,
-    /// Image resized to cols × (rows * 2) pixels for half-block rendering.
+    /// Image resized to (cols * 2) × (rows * 2) pixels.
     resized: DynamicImage,
+}
+
+const QUADRANT_GLYPHS: [char; 16] = [
+    ' ', '▘', '▝', '▀', '▖', '▌', '▞', '▛', '▗', '▚', '▐', '▜', '▄', '▙', '▟', '█',
+];
+
+fn best_quadrant_glyph(
+    pixels: [(u8, u8, u8); 4],
+    background: (u8, u8, u8),
+) -> (char, (u8, u8, u8), (u8, u8, u8)) {
+    let mut best = (QUADRANT_GLYPHS[0], background, background);
+    let mut best_error = u64::MAX;
+
+    for (mask, &glyph) in QUADRANT_GLYPHS.iter().enumerate() {
+        let mut foreground_sum = [0u32; 3];
+        let mut background_sum = [0u32; 3];
+        let mut foreground_count = 0u32;
+        let mut background_count = 0u32;
+        for (index, pixel) in pixels.iter().enumerate() {
+            let (sum, count) = if mask & (1 << index) != 0 {
+                (&mut foreground_sum, &mut foreground_count)
+            } else {
+                (&mut background_sum, &mut background_count)
+            };
+            let channels = [pixel.0, pixel.1, pixel.2];
+            for channel in 0..channels.len() {
+                sum[channel] += channels[channel] as u32;
+            }
+            *count += 1;
+        }
+
+        let average = |sum: [u32; 3], count: u32, fallback: (u8, u8, u8)| {
+            let divisor = count.max(1);
+            let average = (
+                (sum[0] / divisor) as u8,
+                (sum[1] / divisor) as u8,
+                (sum[2] / divisor) as u8,
+            );
+            if count == 0 { fallback } else { average }
+        };
+        let foreground = average(foreground_sum, foreground_count, background);
+        let cell_background = average(background_sum, background_count, background);
+        let mut error = 0u64;
+        for (index, pixel) in pixels.iter().enumerate() {
+            let color = if mask & (1 << index) != 0 {
+                foreground
+            } else {
+                cell_background
+            };
+            let pixel_channels = [pixel.0, pixel.1, pixel.2];
+            let color_channels = [color.0, color.1, color.2];
+            for channel in 0..pixel_channels.len() {
+                let difference = pixel_channels[channel] as i32 - color_channels[channel] as i32;
+                error += (difference * difference) as u64;
+            }
+        }
+
+        if error < best_error {
+            best_error = error;
+            best = (glyph, foreground, cell_background);
+        }
+    }
+
+    best
 }
 
 /// Pre-rendered Terminology image: a local filesystem path Terminology will read.
@@ -868,6 +931,7 @@ pub struct ImageCache {
 
     // Half-block: resized images for Unicode block rendering
     halfblock_images: HashMap<String, HalfBlockImage>,
+    float_halfblock_images: HashMap<(String, usize), HalfBlockImage>,
     // Terminology: path-based images (None = pre-render failed)
     terminology_images: HashMap<String, Option<TerminologyImage>>,
     /// Paths of temp PNG files we created; deleted on cache clear / Drop.
@@ -912,6 +976,7 @@ impl ImageCache {
             iterm2_images: HashMap::new(),
             sixel_images: HashMap::new(),
             halfblock_images: HashMap::new(),
+            float_halfblock_images: HashMap::new(),
             terminology_images: HashMap::new(),
             temp_files: Arc::new(Mutex::new(Vec::new())),
             last_render_width: 0,
@@ -946,6 +1011,7 @@ impl ImageCache {
             self.render_receiver = render_receiver;
             self.render_in_flight.clear();
             self.halfblock_images.clear();
+            self.float_halfblock_images.clear();
             self.delete_temp_files();
             self.terminology_images.clear();
         } else {
@@ -1030,7 +1096,7 @@ impl ImageCache {
 
     /// Insert a pre-loaded image directly (used in tests).
     #[cfg(test)]
-    fn insert(&mut self, url: &str, img: Option<image::DynamicImage>) {
+    pub(crate) fn insert(&mut self, url: &str, img: Option<image::DynamicImage>) {
         self.images.insert(url.to_string(), img.map(Arc::new));
     }
 
@@ -1057,6 +1123,91 @@ impl ImageCache {
     pub fn ideal_rows(&self, url: &str, content_width: usize) -> Option<usize> {
         let (_, rows) = self.display_size(url, content_width, MAX_IMAGE_ROWS)?;
         Some(rows)
+    }
+
+    pub fn float_display_size(&self, url: &str, max_cols: usize) -> Option<(usize, usize)> {
+        let extension = std::path::Path::new(url)
+            .extension()?
+            .to_str()?
+            .to_ascii_lowercase();
+        if !matches!(extension.as_str(), "png" | "jpg" | "jpeg") {
+            return None;
+        }
+        self.display_size(url, max_cols, MAX_IMAGE_ROWS)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_float_row(
+        &mut self,
+        stdout: &mut impl Write,
+        url: &str,
+        image_row: usize,
+        max_cols: usize,
+        x_offset: usize,
+        content_width: usize,
+        bg: crossterm::style::Color,
+    ) -> io::Result<bool> {
+        let key = (url.to_string(), max_cols);
+        if !self.float_halfblock_images.contains_key(&key) {
+            let Some(source) = self.images.get(url).and_then(|image| image.as_ref()) else {
+                return Ok(false);
+            };
+            let Some((cols, rows)) = self.float_display_size(url, max_cols) else {
+                return Ok(false);
+            };
+            let resized =
+                source.resize_exact((cols * 2) as u32, (rows * 2) as u32, FilterType::Lanczos3);
+            self.float_halfblock_images.insert(
+                key.clone(),
+                HalfBlockImage {
+                    cols,
+                    rows,
+                    resized,
+                },
+            );
+        }
+
+        let Some(image) = self.float_halfblock_images.get(&key) else {
+            return Ok(false);
+        };
+        if image_row >= image.rows || x_offset >= content_width {
+            return Ok(false);
+        }
+
+        let bg_rgb = color_to_rgb(bg);
+        write!(stdout, "{}", " ".repeat(x_offset))?;
+        let visible_cols = image.cols.min(content_width.saturating_sub(x_offset));
+        let top_y = (image_row * 2) as u32;
+        for col in 0..visible_cols as u32 {
+            let x = col * 2;
+            let pixels = [
+                blend_alpha(image.resized.get_pixel(x, top_y), bg_rgb),
+                blend_alpha(image.resized.get_pixel(x + 1, top_y), bg_rgb),
+                blend_alpha(image.resized.get_pixel(x, top_y + 1), bg_rgb),
+                blend_alpha(image.resized.get_pixel(x + 1, top_y + 1), bg_rgb),
+            ];
+            let (glyph, foreground, cell_background) = best_quadrant_glyph(pixels, bg_rgb);
+            write!(
+                stdout,
+                "\x1b[38;2;{};{};{};48;2;{};{};{}m{}",
+                foreground.0,
+                foreground.1,
+                foreground.2,
+                cell_background.0,
+                cell_background.1,
+                cell_background.2,
+                glyph
+            )?;
+        }
+        write!(
+            stdout,
+            "\x1b[0m\x1b[48;2;{};{};{}m{}",
+            bg_rgb.0,
+            bg_rgb.1,
+            bg_rgb.2,
+            " ".repeat(content_width.saturating_sub(x_offset + visible_cols))
+        )?;
+        Ok(true)
     }
 
     #[cfg(test)]
@@ -1165,6 +1316,7 @@ impl ImageCache {
             self.iterm2_images.clear();
             self.sixel_images.clear();
             self.halfblock_images.clear();
+            self.float_halfblock_images.clear();
             self.delete_temp_files();
             self.terminology_images.clear();
             // Cancel stale in-flight pre-renders for the old width
@@ -1926,10 +2078,9 @@ fn terminology_path_safe(path: &str) -> bool {
 /// string, using `/dev/urandom` on Unix.
 /// Falls back to PID + timestamp if `/dev/urandom` is unavailable.
 fn random_hex_suffix() -> String {
-
     #[cfg(unix)]
     {
-        let  mut buf = [0u8; 8];
+        let mut buf = [0u8; 8];
         use std::io::Read;
         if let Ok(mut f) = std::fs::File::open("/dev/urandom")
             && f.read_exact(&mut buf).is_ok()
@@ -2122,7 +2273,12 @@ fn fetch_image(url: &str) -> Option<DynamicImage> {
                 return None;
             }
         }
-        image::open(url).ok()
+        image::ImageReader::open(path)
+            .ok()?
+            .with_guessed_format()
+            .ok()?
+            .decode()
+            .ok()
     }
 }
 
@@ -2299,6 +2455,21 @@ mod tests {
     }
 
     #[test]
+    fn local_fetch_uses_image_signature_not_extension() {
+        let relative_path = format!("target/mdterm-mislabeled-{}.jpg", std::process::id());
+        let absolute_path = std::env::current_dir().unwrap().join(&relative_path);
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(3, 2)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(&absolute_path, encoded.into_inner()).unwrap();
+
+        let decoded = fetch_image(&relative_path).expect("detect image format from file bytes");
+        assert_eq!(decoded.dimensions(), (3, 2));
+        std::fs::remove_file(absolute_path).unwrap();
+    }
+
+    #[test]
     fn has_attempted_and_has_image_are_independent() {
         // has_attempted subsumes has_image: any URL where has_image is true
         // must also satisfy has_attempted, but not vice-versa.
@@ -2470,6 +2641,49 @@ mod tests {
         assert!(rows <= 20);
         assert!(cols >= 1);
         assert!(rows >= 1);
+    }
+
+    #[test]
+    fn quadrant_renderer_uses_two_by_two_diagonal_glyph() {
+        let red = (255, 0, 0);
+        let blue = (0, 0, 255);
+        let (glyph, foreground, background) =
+            best_quadrant_glyph([red, blue, blue, red], (0, 0, 0));
+
+        assert!(matches!(glyph, '▚' | '▞'));
+        assert_ne!(foreground, background);
+    }
+
+    #[test]
+    fn float_row_renders_at_requested_offset_and_width() {
+        let mut cache = ImageCache::new();
+        cache.insert(
+            "float-render.png",
+            Some(image::DynamicImage::ImageRgba8(
+                image::RgbaImage::from_pixel(16, 8, image::Rgba([255, 0, 0, 255])),
+            )),
+        );
+        let (cols, rows) = cache.float_display_size("float-render.png", 4).unwrap();
+        assert!(cols <= 4);
+        assert!(rows > 0);
+
+        let mut output = Vec::new();
+        assert!(
+            cache
+                .render_float_row(
+                    &mut output,
+                    "float-render.png",
+                    0,
+                    4,
+                    2,
+                    12,
+                    crossterm::style::Color::Black,
+                )
+                .unwrap()
+        );
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.starts_with("  \x1b[38;2;"));
+        assert!(output.ends_with("      "));
     }
 
     #[test]

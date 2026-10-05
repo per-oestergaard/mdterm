@@ -130,10 +130,25 @@ fn main() {
                     process::exit(1);
                 });
                 let w = if width > 0 { width } else { 120 };
+                let base_dir = std::path::Path::new(&filename).parent();
                 if fmt == "svg" {
-                    export::export_slides_svg(&content, w, &initial_theme, prefix, cli.slides);
+                    export::export_slides_svg(
+                        &content,
+                        w,
+                        &initial_theme,
+                        prefix,
+                        cli.slides,
+                        base_dir,
+                    );
                 } else {
-                    export::export_slides_png(&content, w, &initial_theme, prefix, cli.slides);
+                    export::export_slides_png(
+                        &content,
+                        w,
+                        &initial_theme,
+                        prefix,
+                        cli.slides,
+                        base_dir,
+                    );
                 }
             }
             "odp" | "odp+svg" | "odp+png" => {
@@ -142,6 +157,7 @@ fn main() {
                     process::exit(1);
                 });
                 let w = if width > 0 { width } else { 120 };
+                let base_dir = std::path::Path::new(&filename).parent();
                 let kind = if fmt == "odp+png" {
                     export::OdpImageKind::Png
                 } else {
@@ -152,9 +168,15 @@ fn main() {
                         "Note: SVG-based ODP may not open in PowerPoint. Use --export odp+png for PowerPoint compatibility."
                     );
                 }
-                if let Err(e) =
-                    export::export_odp(&content, w, &initial_theme, out_file, cli.slides, kind)
-                {
+                if let Err(e) = export::export_odp(
+                    &content,
+                    w,
+                    &initial_theme,
+                    out_file,
+                    cli.slides,
+                    kind,
+                    base_dir,
+                ) {
                     eprintln!("Error writing '{}': {}", out_file, e);
                     process::exit(1);
                 }

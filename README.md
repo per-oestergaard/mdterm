@@ -113,6 +113,15 @@ mdterm README.md | less -R
 
 Slides show only the current slide content (no adjacent slides visible). Tall slides can be scrolled.
 
+SVG and PNG slide exports support local raster images floated beside text:
+
+```markdown
+<!-- mdterm:wrap width=32% side=right -->
+![Speaker](images/speaker.jpg)
+```
+
+`width` accepts 1% through 80%, and `side` is `left` or `right`. The interactive viewer draws floats with Unicode quarter-block cells; ordinary images continue to use the detected terminal image protocol.
+
 | Key | Action |
 |-----|--------|
 | `j` / `Down` | Scroll down one line within slide |
